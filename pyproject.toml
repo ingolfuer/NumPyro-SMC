@@ -1,0 +1,40 @@
+[project]
+name = "numpyro_smc"
+version = "0.1.0"
+description = "Provides Sequential Monte Carlo sampling algorighms for NumPyro."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "jax>=0.8.2",
+    "numpy>=1.26.4",
+    "numpyro>=0.19.0",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "jax[cuda12]>=0.8.2",
+]
+
+[dependency-groups]
+dev = [
+    "matplotlib>=3.10.0",
+    "jupyter>=1.1.1",
+    "seaborn>=0.13.2",
+    "arviz>=0.20.0",
+    "pyprojroot>=0.3.0",
+    "line-profiler>=4.2.0",
+    "ipykernel>=6.29.5",
+    "black[jupyter]>=25.1.0",
+    "pytest>=8.3.5",
+    "pytest-xdist>=3.8.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
