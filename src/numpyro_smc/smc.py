@@ -89,10 +89,11 @@ def _smc_step(carry, model_args, model_kwargs, kernel: SMCKernel, ess_threshold)
     # Conditional resampling using jax.lax.cond
     def resample_and_mutate(args):
         state, rng_key = args
+        log_likelihoods = state.split_log_probs[:,0]
 
         # Adaptive tempering: find next beta
         beta_next = _adaptive_tempering_step(
-            log_likelihoods=state.log_likelihoods,
+            log_likelihoods=log_likelihoods,
             beta_current=state.beta,
             ess_threshold=ess_threshold,
         )
@@ -101,7 +102,7 @@ def _smc_step(carry, model_args, model_kwargs, kernel: SMCKernel, ess_threshold)
         delta_beta = beta_next - state.beta
 
         # Compute weights
-        log_weights = delta_beta * state.log_likelihoods
+        log_weights = delta_beta * log_likelihoods
         log_weights = log_weights - jax.scipy.special.logsumexp(log_weights)
 
         # Resample
