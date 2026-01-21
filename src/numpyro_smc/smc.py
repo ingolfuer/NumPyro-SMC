@@ -82,14 +82,16 @@ def _resample_particles(state, log_weights, resample_fields, rng_key):
     return type(state)(**new_fields)
 
 
-def _smc_step(carry, model_args, model_kwargs, kernel: SMCKernel, ess_threshold):
+def _smc_step(
+    carry, num_mcmc_steps, model_args, model_kwargs, kernel: SMCKernel, ess_threshold
+):
     """Single SMC step - can be scanned over."""
     state, rng_key = carry
 
     # Conditional resampling using jax.lax.cond
     def resample_and_mutate(args):
         state, rng_key = args
-        log_likelihoods = state.split_log_probs[:,0]
+        log_likelihoods = state.split_log_probs[:, 0]
 
         # Adaptive tempering: find next beta
         beta_next = _adaptive_tempering_step(
@@ -115,8 +117,12 @@ def _smc_step(carry, model_args, model_kwargs, kernel: SMCKernel, ess_threshold)
         )
 
         # Mutate particles
-        state = kernel.mutate(
-            state, beta_next, model_args=model_args, model_kwargs=model_kwargs
+        state = kernel.multi_step_mutate(
+            state,
+            beta_next,
+            model_args=model_args,
+            model_kwargs=model_kwargs,
+            num_mcmc_steps=num_mcmc_steps,
         )
 
         return state, rng_key
@@ -136,6 +142,7 @@ def _single_chain_smc(
     num_chains: int,
     num_particles: int,
     num_steps: int,
+    num_mcmc_steps: int,
     ess_threshold: float,
     model_args: tuple,
     model_kwargs: dict,
@@ -157,6 +164,7 @@ def _single_chain_smc(
     # Create the step function with fixed arguments
     step_fn = partial(
         _smc_step,
+        num_mcmc_steps=num_mcmc_steps,
         model_args=model_args,
         model_kwargs=model_kwargs,
         kernel=kernel,
@@ -208,6 +216,7 @@ def sample_SMC(
     num_chains: int = 4,
     num_particles: int = 500,
     num_steps: int = 10,
+    num_mcmc_steps: int = 1,
     ess_threshold: float = 0.5,
     model_args=(),
     model_kwargs=None,
@@ -247,6 +256,7 @@ def sample_SMC(
         num_chains if chain_method == "parallel" else 1,
         num_particles,
         num_steps,
+        num_mcmc_steps,
         ess_threshold,
         model_args,
         model_kwargs,
@@ -254,17 +264,9 @@ def sample_SMC(
         extra_fields=extra_fields,
     )
 
-    # if num_chains == 1:
-    #     samples, collected_extra_fields_flat = partial_map_fn(rng_key)
-    #     # Add chain dimension
-    #     samples = jax.tree.map(lambda x: x[jnp.newaxis, ...], samples)
-    #     collected_extra_fields = jax.tree.map(
-    #         lambda x: x[jnp.newaxis, ...], collected_extra_fields_flat
-    #     )
-    # else:
     if num_chains == 1:
         chain_method = "sequential"
-
+        
     if chain_method == "sequential":
         ret = _laxmap(partial_map_fn, rng_key)
     elif chain_method == "parallel":

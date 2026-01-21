@@ -6,6 +6,7 @@ import numpyro.distributions as dist
 from numpyro.infer import MCMC, ESS
 import matplotlib.pyplot as plt
 import arviz as az
+import numpy as np
 
 from numpyro_smc.smc import sample_SMC
 from numpyro_smc.kernels import GaussianRandomWalkMetropolisSMC, LangevinMetropolisSMC
@@ -24,10 +25,20 @@ def test_smc():
     def test_model_3():
         x = numpyro.sample("x", dist.Dirichlet(concentration=jnp.ones(4)))
 
-    n_steps = 10
+    def test_model_4():
+        x = numpyro.sample("x", dist.Normal(loc=0, scale=0.1))
+
+        numpyro.factor(
+            "mixture",
+            jax.scipy.special.logsumexp(
+                jnp.array([-20 * (x - 5) ** 2, -20 * (x + 5) ** 2])
+            ),
+        )
+
+    n_steps = 20
     rng_key = jax.random.key(6)
 
-    for model in [test_model_1, test_model_2, test_model_3]:
+    for model in [test_model_1, test_model_2, test_model_3, test_model_4]:
         for kernel_type in [GaussianRandomWalkMetropolisSMC, LangevinMetropolisSMC]:
             kernel = kernel_type(model, step_size=1, likelihood_chunk_size=3200)
             samples, extra = sample_SMC(
@@ -35,10 +46,11 @@ def test_smc():
                 num_chains=4,
                 num_particles=500,
                 num_steps=n_steps,
+                num_mcmc_steps=25,
                 ess_threshold=0.5,
                 rng_key=rng_key,
                 progress_bar=False,
-                extra_fields=("beta",),
+                extra_fields=("beta", "accept_prob"),
             )
 
             idata = az.from_dict(posterior=samples)
@@ -47,12 +59,16 @@ def test_smc():
             plt.tight_layout()
             plt.show()
             # print(extra["beta"])
+            # plt.plot(np.log(extra["beta"]).T)
+            plt.plot(extra["accept_prob"].mean(axis=-1).T)
+            plt.ylim(0, 1)
 
         mcmc = MCMC(
             ESS(model),
             num_chains=16,
             num_samples=400,
             num_warmup=200,
+            progress_bar=False,
             chain_method="vectorized",
         )
         mcmc.run(rng_key)

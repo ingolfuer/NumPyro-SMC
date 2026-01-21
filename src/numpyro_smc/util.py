@@ -108,6 +108,39 @@ def compute_split_log_probs(
 
     return split_log_joint, model_trace
 
+# based on NumPyro code:
+# def batch_ravel_pytree(pytree, batch_ndims=1):
+#     """
+#     Ravel (flatten) a pytree of arrays with leading batch dimensions down to a (*batch_shape, 1D) array.
+#     Args:
+#       pytree: a pytree of arrays and scalars to ravel.
+#       batch_ndims: number of leading dimensions to preserve (not flatten). Default is 1.
+#     Returns:
+#       A pair where the first element is a (*batch_shape, 1D) array representing the flattened and
+#       concatenated leaf values, with dtype determined by promoting the dtypes of
+#       leaf values, and the second element is a callable for unflattening a (*batch_shape, 1D)
+#       array of the same length back to a pytree of the same structure as the
+#       input ``pytree``. If the input pytree is empty (i.e. has no leaves) then as
+#       a convention a 1D empty array of dtype float32 is returned in the first
+#       component of the output.
+#     """
+#     # Apply vmap batch_ndims times
+#     ravel_single = lambda x: jax.flatten_util.ravel_pytree(x)[0]
+#     for _ in range(batch_ndims):
+#         ravel_single = jax.vmap(ravel_single)
+    
+#     flat = ravel_single(pytree)
+    
+#     # Get a single example by indexing into the first elements of batch dimensions
+#     single_example = pytree
+#     for _ in range(batch_ndims):
+#         single_example = jax.tree.map(lambda z: z[0], single_example)
+    
+#     unravel_single = jax.flatten_util.ravel_pytree(single_example)[1]
+#     for _ in range(batch_ndims):
+#         unravel_single = jax.vmap(unravel_single)
+    
+#     return flat, unravel_single
 
 def ravel_batched_pytree(
     pytree: Any, batch_ndims: int = 1

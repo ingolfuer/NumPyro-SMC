@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from numpyro.util import soft_vmap, identity
+from numpyro.util import identity
 from numpyro.infer import Predictive
 from numpyro.infer.util import get_transforms, transform_fn, initialize_model
 from numpyro.handlers import seed
@@ -116,6 +116,27 @@ class SMCKernel(ABC):
             return identity
         return jax.vmap(self._postprocess_fn(*model_args, **model_kwargs))
 
+    def multi_step_mutate(self, state, beta, model_args, model_kwargs, num_mcmc_steps):
+        """
+        Apply multiple mutation steps. Default implementation calls mutate repeatedly.
+        Kernels can override for optimizations (e.g., reusing mass matrix).
+
+        Args:
+            state: Current SMCState
+            beta: Temperature parameter
+            model_args: Positional arguments for the model
+            model_kwargs: Keyword arguments for the model
+            num_mcmc_steps: Number of MCMC steps to perform
+
+        Returns:
+            New SMCState after num_mcmc_steps mutations
+        """
+
+        def mutate_step(i, state):
+            return self.mutate(state, beta, model_args, model_kwargs)
+
+        return jax.lax.fori_loop(0, num_mcmc_steps, mutate_step, state)
+
     @property
     @abstractmethod
     def sample_field(self):
@@ -211,11 +232,10 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
         )
 
         def split_log_probs_fn(samples_unconstrained):
-            return soft_vmap(
+            return jax.lax.map(
                 split_log_probs_fn_,
                 xs=samples_unconstrained,
-                batch_ndims=1,
-                chunk_size=self._likelihood_chunk_size,
+                batch_size=self._likelihood_chunk_size,
             )
 
         self._split_log_probs_fn = split_log_probs_fn
@@ -306,7 +326,6 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
             noise @ mass_matrix_sqrt.T
         )
         particles_unconstrained_prop = unravel_fn(raveled_prop)
-        particles_constrained_prop = self._constrain_fn(particles_unconstrained_prop)
 
         # Compute log densities for proposed particles
         # split_log_prob_fn returns [log_likelihood, log_prior, log_det]
@@ -435,11 +454,10 @@ class LangevinMetropolisSMC(SMCKernel):
         )
 
         def split_log_prob_and_grad_fn(samples_unconstrained):
-            return soft_vmap(
+            return jax.lax.map(
                 value_and_jac(split_log_prob_fn_),
                 xs=samples_unconstrained,
-                batch_ndims=1,
-                chunk_size=self._likelihood_chunk_size,
+                batch_size=self._likelihood_chunk_size,
             )
 
         self._split_log_prob_and_grad_fn = split_log_prob_and_grad_fn
