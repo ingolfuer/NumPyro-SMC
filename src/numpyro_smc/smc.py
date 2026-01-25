@@ -10,7 +10,6 @@ from numpyro.util import (
     is_prng_key,
     nested_attrgetter,
 )
-from numpyro.infer.mcmc import _laxmap
 from typing import Literal
 
 from .kernels import SMCKernel
@@ -211,6 +210,22 @@ def _single_chain_smc(
         return particles_constrained
 
 
+_single_chain_smc_jit = jax.jit(
+    _single_chain_smc,
+    static_argnames=[
+        "kernel",
+        "num_chains",
+        "num_particles",
+        "num_steps",
+        "num_mcmc_steps",
+        "model_args",
+        "model_kwargs",
+        "progress_bar",
+        "extra_fields",
+    ],
+)
+
+
 def sample_SMC(
     kernel: SMCKernel,
     num_chains: int = 4,
@@ -224,6 +239,7 @@ def sample_SMC(
     chain_method: Literal["sequential", "vectorized", "parallel"] = "vectorized",
     progress_bar=True,
     extra_fields=(),
+    jit_sample_fn=False,
 ):
     """
     Estimate posterior using Sequential Monte Carlo with adaptive tempering.
@@ -245,13 +261,13 @@ def sample_SMC(
         particles_constrained: Final particles in constrained space
         extra: Dict of collected collected_extra_fields fields (if extra_fields is non-empty)
     """
-    rng_key = random.split(rng_key, num_chains)
+    rng_keys = random.split(rng_key, num_chains)
 
     # Validate extra_fields
     assert isinstance(extra_fields, (tuple))
 
     partial_map_fn = partial(
-        _single_chain_smc,
+        _single_chain_smc_jit if jit_sample_fn else _single_chain_smc,
         kernel,
         num_chains if chain_method == "parallel" else 1,
         num_particles,
@@ -266,14 +282,17 @@ def sample_SMC(
 
     if num_chains == 1:
         chain_method = "sequential"
-        
+
     if chain_method == "sequential":
-        ret = _laxmap(partial_map_fn, rng_key)
+        ret = jax.lax.map(partial_map_fn, rng_keys)
     elif chain_method == "parallel":
-        ret = jax.pmap(partial_map_fn)(rng_key)
+        ret = jax.pmap(partial_map_fn)(rng_keys)
     else:  # vectorized
         assert chain_method == "vectorized"
-        ret = jax.jit(jax.vmap(partial_map_fn))(rng_key)
+        if jit_sample_fn:
+            ret = jax.jit(jax.vmap(partial_map_fn))(rng_keys)
+        else:
+            ret = jax.vmap(partial_map_fn)(rng_keys)
 
     return ret
 
@@ -421,7 +440,9 @@ class SMC:
             )
         else:
             if self.chain_method == "sequential":
-                collected_extra_fields, last_state = _laxmap(partial_map_fn, rng_key)
+                collected_extra_fields, last_state = jax.lax.map(
+                    partial_map_fn, rng_key
+                )
             elif self.chain_method == "parallel":
                 collected_extra_fields, last_state = jax.pmap(partial_map_fn)(rng_key)
             else:  # vectorized
