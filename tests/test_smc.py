@@ -49,7 +49,8 @@ def test_smc():
                 num_mcmc_steps=25,
                 ess_threshold=0.5,
                 rng_key=rng_key,
-                progress_bar=False,
+                chain_method="vectorized",
+                progress_bar=True,
                 extra_fields=("beta", "accept_prob"),
             )
 

@@ -10,6 +10,7 @@ from numpyro.util import (
     is_prng_key,
     nested_attrgetter,
 )
+from numpyro.infer.mcmc import _laxmap
 from typing import Literal
 
 from .kernels import SMCKernel
@@ -53,21 +54,21 @@ def _adaptive_tempering_step(log_likelihoods, beta_current, ess_threshold):
     return beta_min
 
 
-def _resample_particles(state, log_weights, resample_fields, rng_key):
+def _resample_particles(state, log_weights, resample_fields):
     """
     Resample particles and associated metadata using categorical sampling.
 
     Args:
         state: Current SMCState namedtuple.
         resample_fields: List of fields that represent per-particle data and need resampling.
-        rng_key: JAX random key.
 
     Returns:
         A new SMCState with particles and scores resampled.
     """
     num_particles = log_weights.shape[0]
+    rng_key, resample_key = jax.random.split(state.rng_key)
     indices = jax.random.categorical(
-        rng_key, logits=log_weights, shape=(num_particles,)
+        resample_key, logits=log_weights, shape=(num_particles,)
     )
 
     new_fields = {}
@@ -77,19 +78,23 @@ def _resample_particles(state, log_weights, resample_fields, rng_key):
             new_fields[field] = jax.tree.map(lambda x: x[indices], value)
         else:
             new_fields[field] = value
+    new_fields["rng_key"] = rng_key
 
     return type(state)(**new_fields)
 
 
-def _smc_step(
-    carry, num_mcmc_steps, model_args, model_kwargs, kernel: SMCKernel, ess_threshold
-):
-    """Single SMC step - can be scanned over."""
-    state, rng_key = carry
+def _init_smc(kernel, num_particles, model_args, model_kwargs, rng_key):
+    """Initialize SMC state using kernel.init."""
+    return kernel.init(rng_key, num_particles, model_args, model_kwargs)
 
-    # Conditional resampling using jax.lax.cond
-    def resample_and_mutate(args):
-        state, rng_key = args
+
+_init_smc_vmapped = jax.vmap(_init_smc, in_axes=(None, None, None, None, 0))
+
+
+def _smc_step(kernel, num_mcmc_steps, ess_threshold, model_args, model_kwargs, state):
+    """Single SMC step - can be scanned over."""
+
+    def resample_and_mutate():
         log_likelihoods = state.split_log_probs[:, 0]
 
         # Adaptive tempering: find next beta
@@ -107,72 +112,50 @@ def _smc_step(
         log_weights = log_weights - jax.scipy.special.logsumexp(log_weights)
 
         # Resample
-        rng_key, resample_key = jax.random.split(rng_key)
-        state = _resample_particles(
+        resampled_state = _resample_particles(
             state=state,
             log_weights=log_weights,
             resample_fields=kernel.resample_fields,
-            rng_key=resample_key,
         )
 
         # Mutate particles
-        state = kernel.multi_step_mutate(
-            state,
+        mutated_state = kernel.multi_step_mutate(
+            resampled_state,
             beta_next,
             model_args=model_args,
             model_kwargs=model_kwargs,
             num_mcmc_steps=num_mcmc_steps,
         )
 
-        return state, rng_key
+        return mutated_state
 
-    def no_op(args):
-        return args
+    def no_op():
+        return state
 
-    state, next_rng_key = jax.lax.cond(
-        state.beta != 1.0, resample_and_mutate, no_op, (state, rng_key)
-    )
-
-    return (state, next_rng_key)
+    return jax.lax.cond(state.beta != 1.0, resample_and_mutate, no_op)
 
 
-def _single_chain_smc(
-    kernel: SMCKernel,
-    num_chains: int,
-    num_particles: int,
-    num_steps: int,
-    num_mcmc_steps: int,
-    ess_threshold: float,
-    model_args: tuple,
-    model_kwargs: dict,
+_smc_step_vmapped = jax.vmap(_smc_step, in_axes=(None, None, None, None, None, 0))
+
+
+def _smc_loop(
+    init_fn,
+    step_fn,
+    num_chains,
+    num_steps,
     rng_key,
-    progress_bar: bool,
-    extra_fields: tuple,
+    progress_bar,
+    extra_fields,
 ):
-    if model_kwargs is None:
-        model_kwargs = {}
-
     # Initialize particles from prior
-    rng_key, init_key = jax.random.split(rng_key)
-    state = kernel.init(init_key, num_particles, model_args, model_kwargs)
+    init_state = init_fn(rng_key)
 
     # Prepare collection fields
     assert isinstance(extra_fields, (tuple, list))
     collect_fields = tuple(extra_fields) if extra_fields else ()
 
-    # Create the step function with fixed arguments
-    step_fn = partial(
-        _smc_step,
-        num_mcmc_steps=num_mcmc_steps,
-        model_args=model_args,
-        model_kwargs=model_kwargs,
-        kernel=kernel,
-        ess_threshold=ess_threshold,
-    )
-
     # Transform function for fori_collect
-    def extract_fn(carry):
-        state, rng_key = carry
+    def extract_fn(state):
         if collect_fields:
             # Extract requested fields from state
             fields = nested_attrgetter(*collect_fields)(state)
@@ -181,49 +164,25 @@ def _single_chain_smc(
             return ()
 
     # Use fori_collect to run the SMC loop with progress bar support
-    # TODO: only pass rng_key to kernel - require it to be part of the state
-    init_carry = (state, rng_key)
-
-    collected, final_carry = fori_collect(
+    collected, final_state = fori_collect(
         0,
         num_steps,
         step_fn,
-        init_carry,
+        init_state,
         transform=extract_fn,
         progbar=progress_bar,
         return_last_val=True,
         progbar_desc=lambda i: f"SMC step {i+1}/{num_steps}",
         num_chains=num_chains,
     )
-    state, _ = final_carry
 
     # Package collected fields into a dict
     extra = dict(zip(collect_fields, collected))
 
-    # Post-processing - transform to constrained space and add deterministic sites
-    postprocess_fn = kernel.postprocess_fn(model_args, model_kwargs)
-    particles_constrained = postprocess_fn(state.z)
-
     if extra_fields:
-        return particles_constrained, extra
+        return final_state, extra
     else:
-        return particles_constrained
-
-
-_single_chain_smc_jit = jax.jit(
-    _single_chain_smc,
-    static_argnames=[
-        "kernel",
-        "num_chains",
-        "num_particles",
-        "num_steps",
-        "num_mcmc_steps",
-        "model_args",
-        "model_kwargs",
-        "progress_bar",
-        "extra_fields",
-    ],
-)
+        return final_state
 
 
 def sample_SMC(
@@ -247,54 +206,83 @@ def sample_SMC(
     Args:
         kernel: SMCKernel instance for particle mutation
         num_chains: Number of independent chains to run
-        num_samples: Number of particles (per chain)
+        num_particles: Number of particles (per chain)
         num_steps: Maximum number of SMC steps
-        ess_threshold: ESS threshold as fraction of n_samples for adaptive tempering
-        model_args: Tuple of model arguments
-        model_kwargs: Dict of model keyword arguments
+        num_mcmc_steps: Number of MCMC steps per SMC step
+        ess_threshold: ESS threshold as fraction of num_particles for adaptive tempering
+        model_args: Tuple of model arguments (must be JAX-compatible)
+        model_kwargs: Dict of model keyword arguments (must be JAX-compatible)
         rng_key: JAX random key
-        progress_bar: Whether to display progress bar. Only partially working.
+        chain_method: Method for running chains ('sequential', 'vectorized', or 'parallel')
+        progress_bar: Whether to display progress bar
         extra_fields: Extra fields from the SMCState to collect at each iteration.
             Similar to MCMC.run, specify field names like "log_likelihoods", "accept_prob", "beta" etc.
+        jit_sample_fn: Whether to JIT compile the sample function
 
     Returns:
-        particles_constrained: Final particles in constrained space
-        extra: Dict of collected collected_extra_fields fields (if extra_fields is non-empty)
+        particles_constrained: Final particles in constrained space (shape: [num_chains, num_particles, ...])
+        extra: Dict of collected extra_fields (if extra_fields is non-empty) (shape: [num_steps, num_chains, num_particles, ...])
     """
+    if model_kwargs is None:
+        model_kwargs = {}
     rng_keys = random.split(rng_key, num_chains)
 
     # Validate extra_fields
     assert isinstance(extra_fields, (tuple))
 
+    if num_chains == 1:
+        chain_method = "sequential"
+
+    # Select base functions (use vmapped versions if vectorized)
+    if chain_method == "vectorized":
+        base_init = _init_smc_vmapped
+        base_step = _smc_step_vmapped
+    else:
+        base_init = _init_smc
+        base_step = _smc_step
+
+    # Apply jit if requested (before partial to avoid cache misses)
+    if jit_sample_fn:
+        base_init = jax.jit(base_init, static_argnames=("kernel", "num_particles"))
+        base_step = jax.jit(base_step, static_argnames=("kernel", "num_mcmc_steps"))
+
+    # Create init_fn and step_fn with parameters bound via partial
+    init_fn = partial(base_init, kernel, num_particles, model_args, model_kwargs)
+    step_fn = partial(
+        base_step, kernel, num_mcmc_steps, ess_threshold, model_args, model_kwargs
+    )
+
+    # Create the main function to run
     partial_map_fn = partial(
-        _single_chain_smc_jit if jit_sample_fn else _single_chain_smc,
-        kernel,
+        _smc_loop,
+        init_fn,
+        step_fn,
         num_chains if chain_method == "parallel" else 1,
-        num_particles,
         num_steps,
-        num_mcmc_steps,
-        ess_threshold,
-        model_args,
-        model_kwargs,
         progress_bar=progress_bar,
         extra_fields=extra_fields,
     )
 
-    if num_chains == 1:
-        chain_method = "sequential"
-
     if chain_method == "sequential":
-        ret = jax.lax.map(partial_map_fn, rng_keys)
+        ret = _laxmap(partial_map_fn, rng_keys)
     elif chain_method == "parallel":
         ret = jax.pmap(partial_map_fn)(rng_keys)
     else:  # vectorized
         assert chain_method == "vectorized"
-        if jit_sample_fn:
-            ret = jax.jit(jax.vmap(partial_map_fn))(rng_keys)
-        else:
-            ret = jax.vmap(partial_map_fn)(rng_keys)
+        ret = partial_map_fn(rng_keys)
 
-    return ret
+    postprocess_fn = jax.vmap(kernel.postprocess_fn(model_args, model_kwargs))
+    if extra_fields:
+        states, extra = ret
+        particles_constrained = postprocess_fn(states.z)
+        if chain_method != "vectorized":
+            # Swap step and chain axes such that step is first
+            extra = jax.tree.map(lambda x: x.swapaxes(0, 1), extra)
+        return particles_constrained, extra
+    else:
+        states = ret
+        particles_constrained = postprocess_fn(states.z)
+        return particles_constrained
 
 
 class SMC:
