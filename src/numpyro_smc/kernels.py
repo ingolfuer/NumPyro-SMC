@@ -1,8 +1,7 @@
 import jax
 import jax.numpy as jnp
-from numpyro.util import identity
 from numpyro.infer import Predictive
-from numpyro.infer.util import get_transforms, transform_fn, initialize_model
+from numpyro.infer.util import transform_fn, get_potential_fn, _get_model_transforms
 from numpyro.handlers import seed
 from functools import partial
 from abc import ABC, abstractmethod
@@ -12,7 +11,7 @@ import operator
 from .util import ravel_batched_pytree, compute_split_log_probs, value_and_jac
 
 
-def _get_model_functions(model, model_args, model_kwargs):
+def _parse_model(model, model_args, model_kwargs):
     """
     Get transformation and density functions for the model. Transformation functions are vectorized, density functions are not.
 
@@ -22,14 +21,11 @@ def _get_model_functions(model, model_args, model_kwargs):
         model_kwargs: Keyword arguments for the model
 
     Returns:
-        Tuple of (constrain_fn, unconstrain_fn, split_log_probs_fn)
+        Tuple of (constrain_fn, unconstrain_fn, postprocess_fn, split_log_probs_fn, model_trace)
     """
-    if model_kwargs is None:
-        model_kwargs = {}
-
     # get inverse transforms (constrained -> unconstrained)
-    inv_transforms = get_transforms(
-        seed(model, jax.random.key(0)), model_args, model_kwargs, {}
+    (inv_transforms, replay_model, has_enumerate_support, model_trace) = (
+        _get_model_transforms(seed(model, jax.random.key(0)), model_args, model_kwargs)
     )
     # Create forward transforms (unconstrained -> constrained)
     forward_transforms = {k: v.inv for k, v in inv_transforms.items()}
@@ -50,14 +46,33 @@ def _get_model_functions(model, model_args, model_kwargs):
         # sum over sites
         return jax.tree.reduce(operator.add, log_probs_per_site)
 
-    return (constrain_fn, unconstrain_fn, split_log_probs_fn)
+    _, postprocess_fn = get_potential_fn(
+        model,
+        inv_transforms,
+        enum=has_enumerate_support,
+        replay_model=replay_model,
+        dynamic_args=True,
+        model_args=model_args,
+        model_kwargs=model_kwargs,
+    )
+
+    return (
+        constrain_fn,
+        unconstrain_fn,
+        postprocess_fn,
+        split_log_probs_fn,
+        model_trace,
+    )
+
+
+_parse_model_jit = jax.jit(_parse_model, static_argnames="model")
 
 
 def _compute_mass_matrix_sqrt(raveled_particles):
     """Compute Cholesky factor of regularized empirical covariance."""
     cov = jnp.cov(raveled_particles, rowvar=False, bias=True)
     cov = jnp.atleast_2d(cov)
-    cov = cov + 1e-6 * jnp.eye(cov.shape[0])
+    cov = cov + 1e-6 * jnp.eye(cov.shape[0], dtype=jnp.float32)
 
     return jnp.linalg.cholesky(cov)
 
@@ -112,9 +127,13 @@ class SMCKernel(ABC):
         Returns:
             Function that constrains particles
         """
-        if self._postprocess_fn is None:
-            return identity
-        return jax.vmap(self._postprocess_fn(*model_args, **model_kwargs))
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        _, _, postprocess_fn_, _, _ = _parse_model(
+            self._model, model_args, model_kwargs
+        )
+        return jax.vmap(postprocess_fn_(*model_args, **model_kwargs))
 
     def multi_step_mutate(self, state, beta, model_args, model_kwargs, num_mcmc_steps):
         """
@@ -206,11 +225,8 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
         self._likelihood_chunk_size = likelihood_chunk_size
         self._adapt_mass_matrix = adapt_mass_matrix
 
-        # These will be set during init
-        self._constrain_fn = None
-        self._unconstrain_fn = None
+        # If not jitted, these will be set during init
         self._split_log_probs_fn = None
-        self._postprocess_fn = None
 
     @property
     def sample_field(self):
@@ -220,16 +236,15 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
     def resample_fields(self):
         return ["z", "split_log_probs", "accept_prob"]
 
-    def init(self, rng_key, n_particles, model_args, model_kwargs):
-        """Initialize particles from the prior."""
-        rng_key, init_key = jax.random.split(rng_key)
-
-        # Get model functions
-        self._constrain_fn, self._unconstrain_fn, split_log_probs_fn_ = (
-            _get_model_functions(
-                self._model, model_args=model_args, model_kwargs=model_kwargs
-            )
+    def _parse_model(self, model_args, model_kwargs):
+        (_, unconstrain_fn, _, split_log_probs_fn_, model_trace) = _parse_model(
+            self._model, model_args, model_kwargs
         )
+        latent_sites = [
+            name
+            for name, site in model_trace.items()
+            if site["type"] == "sample" and not site["is_observed"]
+        ]
 
         def split_log_probs_fn(samples_unconstrained):
             return jax.lax.map(
@@ -238,23 +253,21 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
                 batch_size=self._likelihood_chunk_size,
             )
 
-        self._split_log_probs_fn = split_log_probs_fn
+        return unconstrain_fn, split_log_probs_fn, latent_sites
 
-        _, _, self._postprocess_fn, model_trace = initialize_model(
-            jax.random.key(0),
-            self._model,
-            dynamic_args=True,
-            model_args=model_args,
-            model_kwargs=model_kwargs,
+    def init(self, rng_key, n_particles, model_args, model_kwargs):
+        """Initialize particles from the prior."""
+        jitted = isinstance(rng_key, jax.core.Tracer)
+
+        unconstrain_fn, split_log_probs_fn, latent_sites = self._parse_model(
+            model_args, model_kwargs
         )
 
-        # Find unobserved (latent) sites
-        latent_sites = [
-            name
-            for name, site in model_trace.items()
-            if site["type"] == "sample" and not site["is_observed"]
-        ]
+        # if not jitted, cache functions
+        if not jitted:
+            self._split_log_probs_fn = split_log_probs_fn
 
+        rng_key, init_key = jax.random.split(rng_key)
         # Sample from prior (constrained space)
         _particles_constrained = Predictive(
             self._model,
@@ -264,23 +277,23 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
         )(init_key, *model_args, **model_kwargs)
 
         # Convert to unconstrained space
-        particles_unconstrained = self._unconstrain_fn(_particles_constrained)
+        particles_unconstrained = unconstrain_fn(_particles_constrained)
 
         # Compute initial density factors
         # split_log_prob_fn returns [log_likelihood, log_prior, log_det]
-        split_log_probs = self._split_log_probs_fn(particles_unconstrained)
+        split_log_probs = split_log_probs_fn(particles_unconstrained)
 
         # Initialize mass matrix
         raveled_particles, _ = ravel_batched_pytree(particles_unconstrained)
-        mass_matrix_sqrt = jnp.eye(raveled_particles.shape[1])
+        mass_matrix_sqrt = jnp.eye(raveled_particles.shape[1], dtype=jnp.float32)
 
         return GaussianRandomWalkMetropolisSMCState(
-            i=0,
+            i=jnp.array(0, dtype=jnp.int32),
             z=particles_unconstrained,
-            beta=0.0,
+            beta=jnp.array(0.0, dtype=jnp.float32),
             split_log_probs=split_log_probs,
-            accept_prob=jnp.zeros(n_particles),
-            mean_accept_prob=0.0,
+            accept_prob=jnp.zeros(n_particles, dtype=jnp.float32),
+            mean_accept_prob=jnp.array(0.0, dtype=jnp.float32),
             mass_matrix_sqrt=mass_matrix_sqrt,
             rng_key=rng_key,
         )
@@ -298,10 +311,18 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
         Returns:
             New GaussianRandomWalkMetropolisState
         """
+        # unpack state
         step = state.i
         particles_unconstrained = state.z
         split_log_probs = state.split_log_probs
         rng_key = state.rng_key
+
+        jitted = isinstance(rng_key, jax.core.Tracer)
+        if jitted:
+            (_, split_log_probs_fn, _) = self._parse_model(model_args, model_kwargs)
+        # if not jitted, fetch from cache
+        else:
+            split_log_probs_fn = self._split_log_probs_fn
 
         # Compute current potential energies
         potential_energies = -(
@@ -329,7 +350,7 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
 
         # Compute log densities for proposed particles
         # split_log_prob_fn returns [log_likelihood, log_prior, log_det]
-        split_log_probs_prop = self._split_log_probs_fn(particles_unconstrained_prop)
+        split_log_probs_prop = split_log_probs_fn(particles_unconstrained_prop)
 
         potential_energies_prop = -(
             split_log_probs_prop[:, 2]
@@ -339,7 +360,9 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
 
         # Metropolis-Hastings accept/reject
         log_accept_ratio = potential_energies - potential_energies_prop
-        accept_prob = jnp.minimum(1.0, jnp.exp(log_accept_ratio))
+        accept_prob = jnp.minimum(
+            jnp.array(1.0, dtype=jnp.float32), jnp.exp(log_accept_ratio)
+        )
 
         accept = jax.random.bernoulli(acceptance_key, p=accept_prob)
 
@@ -423,11 +446,8 @@ class LangevinMetropolisSMC(SMCKernel):
         self._likelihood_chunk_size = likelihood_chunk_size
         self._adapt_mass_matrix = adapt_mass_matrix
 
-        # These will be set during init
-        self._constrain_fn = None
-        self._unconstrain_fn = None
+        # If not jitted, these will be set during init
         self._split_log_prob_and_grad_fn = None
-        self._postprocess_fn = None
 
     @property
     def sample_field(self):
@@ -442,40 +462,39 @@ class LangevinMetropolisSMC(SMCKernel):
             "accept_prob",
         ]
 
-    def init(self, rng_key, n_particles, model_args, model_kwargs):
-        """Initialize particles from the prior."""
-        rng_key, init_key = jax.random.split(rng_key)
-
-        # Get model functions
-        self._constrain_fn, self._unconstrain_fn, split_log_prob_fn_ = (
-            _get_model_functions(
-                self._model, model_args=model_args, model_kwargs=model_kwargs
-            )
+    def _parse_model(self, model_args, model_kwargs):
+        (_, unconstrain_fn, _, split_log_probs_fn_, model_trace) = _parse_model(
+            self._model, model_args, model_kwargs
         )
-
-        def split_log_prob_and_grad_fn(samples_unconstrained):
-            return jax.lax.map(
-                value_and_jac(split_log_prob_fn_),
-                xs=samples_unconstrained,
-                batch_size=self._likelihood_chunk_size,
-            )
-
-        self._split_log_prob_and_grad_fn = split_log_prob_and_grad_fn
-
-        _, _, self._postprocess_fn, model_trace = initialize_model(
-            jax.random.key(0),
-            self._model,
-            dynamic_args=True,
-            model_args=model_args,
-            model_kwargs=model_kwargs,
-        )
-
-        # Find unobserved (latent) sites
         latent_sites = [
             name
             for name, site in model_trace.items()
             if site["type"] == "sample" and not site["is_observed"]
         ]
+
+        def split_log_probs_and_grad_fn(samples_unconstrained):
+            return jax.lax.map(
+                value_and_jac(split_log_probs_fn_),
+                xs=samples_unconstrained,
+                batch_size=self._likelihood_chunk_size,
+            )
+
+        return unconstrain_fn, split_log_probs_and_grad_fn, latent_sites
+
+    def init(self, rng_key, n_particles, model_args, model_kwargs):
+        """Initialize particles from the prior."""
+        jitted = isinstance(rng_key, jax.core.Tracer)
+
+        # Get model functions
+        unconstrain_fn, split_log_probs_and_grad_fn, latent_sites = self._parse_model(
+            model_args, model_kwargs
+        )
+
+        # if not jitted, cache functions
+        if not jitted:
+            self._split_log_probs_and_grad_fn = split_log_probs_and_grad_fn
+
+        rng_key, init_key = jax.random.split(rng_key)
 
         # Sample from prior (constrained space)
         particles_constrained = Predictive(
@@ -486,27 +505,27 @@ class LangevinMetropolisSMC(SMCKernel):
         )(init_key, *model_args, **model_kwargs)
 
         # Convert to unconstrained space
-        particles_unconstrained = self._unconstrain_fn(particles_constrained)
+        particles_unconstrained = unconstrain_fn(particles_constrained)
 
         # Compute initial density factors and gradients
         # split_log_prob_and_grad_fn returns (log_probs, grad_log_probs)
         # where log_probs = [log_likelihood, log_prior, log_det]
-        split_log_probs, grad_split_log_probs = self._split_log_prob_and_grad_fn(
+        split_log_probs, grad_split_log_probs = split_log_probs_and_grad_fn(
             particles_unconstrained
         )
 
         # Initialize mass matrix
         raveled_particles, _ = ravel_batched_pytree(particles_unconstrained)
-        mass_matrix_sqrt = jnp.eye(raveled_particles.shape[1])
+        mass_matrix_sqrt = jnp.eye(raveled_particles.shape[1], dtype=jnp.float32)
 
         return LangevinMetropolisSMCState(
-            i=0,
+            i=jnp.array(0, dtype=jnp.int32),
             z=particles_unconstrained,
-            beta=0.0,
+            beta=jnp.array(0.0, dtype=jnp.float32),
             split_log_probs=split_log_probs,
             grad_split_log_probs=grad_split_log_probs,
-            accept_prob=jnp.zeros(n_particles),
-            mean_accept_prob=0.0,
+            accept_prob=jnp.zeros(n_particles, dtype=jnp.float32),
+            mean_accept_prob=jnp.array(0.0, dtype=jnp.float32),
             mass_matrix_sqrt=mass_matrix_sqrt,
             rng_key=rng_key,
         )
@@ -529,6 +548,16 @@ class LangevinMetropolisSMC(SMCKernel):
         split_log_probs = state.split_log_probs
         grad_split_log_probs = state.grad_split_log_probs
         rng_key = state.rng_key
+
+        jitted = isinstance(rng_key, jax.core.Tracer)
+
+        if jitted:
+            (_, split_log_prob_and_grad_fn, _) = self._parse_model(
+                model_args, model_kwargs
+            )
+        # if not jitted, fetch from cache
+        else:
+            split_log_prob_and_grad_fn = self._split_log_prob_and_grad_fn
 
         step_size = self._step_size
 
@@ -575,8 +604,8 @@ class LangevinMetropolisSMC(SMCKernel):
         particles_unconstrained_prop = unravel_fn(raveled_prop)
 
         # Compute log densities and gradients for proposed particles
-        split_log_probs_prop, grad_split_log_probs_prop = (
-            self._split_log_prob_and_grad_fn(particles_unconstrained_prop)
+        split_log_probs_prop, grad_split_log_probs_prop = split_log_prob_and_grad_fn(
+            particles_unconstrained_prop
         )
 
         # Ravel proposed gradients
@@ -621,7 +650,9 @@ class LangevinMetropolisSMC(SMCKernel):
             + log_reverse_prop_density
             - log_forward_prop_density
         )
-        accept_prob = jnp.minimum(1.0, jnp.exp(log_accept_ratio))
+        accept_prob = jnp.minimum(
+            jnp.array(1.0, dtype=jnp.float32), jnp.exp(log_accept_ratio)
+        )
 
         accept = jax.random.bernoulli(acceptance_key, p=accept_prob)
 

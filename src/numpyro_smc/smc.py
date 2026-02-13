@@ -9,9 +9,11 @@ from numpyro.util import (
     fori_collect,
     is_prng_key,
     nested_attrgetter,
+    control_flow_prims_disabled,
 )
 from numpyro.infer.mcmc import _laxmap
 from typing import Literal
+from time import perf_counter
 
 from .kernels import SMCKernel
 
@@ -48,7 +50,7 @@ def _adaptive_tempering_step(log_likelihoods, beta_current, ess_threshold):
 
     # Run binary search for 20 iterations
     beta_min, beta_max = jax.lax.fori_loop(
-        0, 20, binary_search_step, (beta_current, 1.0)
+        0, 20, binary_search_step, (beta_current, jnp.array(1.0, dtype=jnp.float32))
     )
 
     return beta_min
@@ -246,9 +248,29 @@ def sample_SMC(
         base_init = jax.jit(base_init, static_argnames=("kernel", "num_particles"))
         base_step = jax.jit(base_step, static_argnames=("kernel", "num_mcmc_steps"))
 
+        # Pre-compile functions to measure performance
+        print("Compiling... ", end="")
+        start = perf_counter()
+        key = rng_keys if chain_method == "vectorized" else rng_key
+        base_init.lower(kernel, num_particles, model_args, model_kwargs, key).compile()
+        abstract_state = jax.eval_shape(
+            base_init, kernel, num_particles, model_args, model_kwargs, key
+        )
+        base_step.lower(
+            kernel,
+            num_mcmc_steps,
+            ess_threshold,
+            model_args,
+            model_kwargs,
+            abstract_state,
+        ).compile()
+        print(f"done (took {perf_counter()-start}s)")
+
     # Create init_fn and step_fn with parameters bound via partial
-    init_fn = partial(base_init, kernel, num_particles, model_args, model_kwargs)
-    step_fn = partial(
+    init_fn = jax.tree_util.Partial(
+        base_init, kernel, num_particles, model_args, model_kwargs
+    )
+    step_fn = jax.tree_util.Partial(
         base_step, kernel, num_mcmc_steps, ess_threshold, model_args, model_kwargs
     )
 
@@ -269,7 +291,8 @@ def sample_SMC(
         ret = jax.pmap(partial_map_fn)(rng_keys)
     else:  # vectorized
         assert chain_method == "vectorized"
-        ret = partial_map_fn(rng_keys)
+        with control_flow_prims_disabled():  # don't do any jitting
+            ret = partial_map_fn(rng_keys)
 
     postprocess_fn = jax.vmap(kernel.postprocess_fn(model_args, model_kwargs))
     if extra_fields:
