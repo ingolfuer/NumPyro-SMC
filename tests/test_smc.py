@@ -8,6 +8,9 @@ import matplotlib.pyplot as plt
 import arviz as az
 import numpy as np
 
+jax.config.update("jax_platform_name", "gpu")
+print("JAX device:", jax.numpy.ones(3).device)
+
 from numpyro_smc.smc import sample_SMC
 from numpyro_smc.kernels import GaussianRandomWalkMetropolisSMC, LangevinMetropolisSMC
 
@@ -35,11 +38,20 @@ def test_smc():
             ),
         )
 
+    def test_model_5(use_second_factor=False, coeff=1.0):
+        x = numpyro.sample("x", dist.Normal(loc=0, scale=1))
+
+        numpyro.sample("y1", dist.Normal(coeff * x, 2), obs=2)
+
+        if use_second_factor:
+            numpyro.sample("y2", dist.Normal(coeff * x, 2), obs=3)
+
     n_steps = 20
     rng_key = jax.random.key(6)
 
-    for model in [test_model_1, test_model_2, test_model_3, test_model_4]:
+    for model in [test_model_1, test_model_2, test_model_3, test_model_4, test_model_5]:
         for kernel_type in [GaussianRandomWalkMetropolisSMC, LangevinMetropolisSMC]:
+            print(model.__name__, kernel_type.__name__)
             kernel = kernel_type(model, step_size=1, likelihood_chunk_size=3200)
             samples, extra = sample_SMC(
                 kernel,
@@ -49,9 +61,11 @@ def test_smc():
                 num_mcmc_steps=25,
                 ess_threshold=0.5,
                 rng_key=rng_key,
+                model_kwargs={"coeff": 1.1} if model is test_model_5 else None,
                 chain_method="vectorized",
                 progress_bar=True,
                 extra_fields=("beta", "accept_prob"),
+                jit_sample_fn=True,
             )
 
             idata = az.from_dict(posterior=samples)
@@ -59,10 +73,6 @@ def test_smc():
             az.plot_trace(idata)
             plt.tight_layout()
             plt.show()
-            # print(extra["beta"])
-            # plt.plot(np.log(extra["beta"]).T)
-            plt.plot(extra["accept_prob"].mean(axis=-1).T)
-            plt.ylim(0, 1)
 
         mcmc = MCMC(
             ESS(model),
