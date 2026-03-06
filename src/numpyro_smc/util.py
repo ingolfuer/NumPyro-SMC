@@ -3,6 +3,15 @@ import jax.numpy as jnp
 from collections.abc import Iterable
 import numpy as np
 from typing import Any, Callable, TypeAlias
+from functools import partial
+from collections import namedtuple
+import operator
+from numpyro.infer.util import (
+    transform_fn,
+    _get_model_transforms,
+    constrain_fn as replay_constrain_fn,
+)
+from numpyro.util import identity
 
 from jax._src.lax import lax
 from jax._src import dtypes
@@ -26,9 +35,76 @@ def value_and_jac(f):
     def wrapper(x):
         y, vjp_fn = jax.vjp(f, x)
         jac = jax.vmap(vjp_fn)(jnp.eye(y.shape[0], dtype=y.dtype))
-        return y, jac[0]
+        return y, jac[0]  # jac has length 1
 
     return wrapper
+
+
+SMCModelInfo = namedtuple(
+    "SMCModelInfo",
+    (
+        "inv_transforms",
+        "equivalence_mapping_fn",
+        "split_log_probs_fn",
+        "latent_sites",
+        "model_trace",
+    ),
+)
+
+
+def parse_model(model: Callable, model_args: tuple, model_kwargs: dict) -> SMCModelInfo:
+    """
+    Get transformation and density functions for the model.
+    Functions are operate on single sets of parameters, they are not vmapped.
+
+    Args:
+        model: NumPyro model function
+        model_args: Positional arguments for the model
+        model_kwargs: Keyword arguments for the model
+
+    Returns:
+        SMCModelInfo
+    """
+    (inv_transforms, replay_model, has_enumerate_support, model_trace) = (
+        _get_model_transforms(seed(model, jax.random.key(0)), model_args, model_kwargs)
+    )
+
+    # density function
+    def split_log_probs_fn(z):
+        log_probs_per_site = compute_split_log_probs(
+            model,
+            model_args=model_args,
+            model_kwargs=model_kwargs,
+            params_unconstrained=z,
+            model_inv_transforms=inv_transforms,
+            sum_log_prob=True,
+        )[0]
+        # sum over sites
+        return jax.tree.reduce(operator.add, log_probs_per_site)
+
+    # equivalence map function
+    def equivalence_mapping_fn(z):
+        z_new = {}
+        for name, v in z.items():
+            m = model_trace[name]["infer"].get("equivalence_mapping", identity)
+            z_new[name] = m(v)
+
+        return z_new
+
+    # extract latent sites (sites to be sampled)
+    latent_sites = [
+        name
+        for name, site in model_trace.items()
+        if site["type"] == "sample" and not site["is_observed"]
+    ]
+
+    return SMCModelInfo(
+        inv_transforms=inv_transforms,
+        equivalence_mapping_fn=equivalence_mapping_fn,
+        split_log_probs_fn=split_log_probs_fn,
+        latent_sites=latent_sites,
+        model_trace=model_trace,
+    )
 
 
 def compute_split_log_probs(
@@ -108,6 +184,7 @@ def compute_split_log_probs(
 
     return split_log_joint, model_trace
 
+
 # based on NumPyro code:
 # def batch_ravel_pytree(pytree, batch_ndims=1):
 #     """
@@ -128,19 +205,20 @@ def compute_split_log_probs(
 #     ravel_single = lambda x: jax.flatten_util.ravel_pytree(x)[0]
 #     for _ in range(batch_ndims):
 #         ravel_single = jax.vmap(ravel_single)
-    
+
 #     flat = ravel_single(pytree)
-    
+
 #     # Get a single example by indexing into the first elements of batch dimensions
 #     single_example = pytree
 #     for _ in range(batch_ndims):
 #         single_example = jax.tree.map(lambda z: z[0], single_example)
-    
+
 #     unravel_single = jax.flatten_util.ravel_pytree(single_example)[1]
 #     for _ in range(batch_ndims):
 #         unravel_single = jax.vmap(unravel_single)
-    
+
 #     return flat, unravel_single
+
 
 def ravel_batched_pytree(
     pytree: Any, batch_ndims: int = 1
@@ -189,7 +267,7 @@ def _ravel_batched_list(
         lax.reshape(e, (*leading_shape, m_i)), to_dtype
     )
     raveled = lax.concatenate(
-        [ravel(x, m_i) for x, m_i in zip(lst, trailing_sizes)], dimension=1
+        [ravel(x, m_i) for x, m_i in zip(lst, trailing_sizes)], dimension=batch_ndims
     )
     unrav = HashablePartial(
         _unravel_batched_list,

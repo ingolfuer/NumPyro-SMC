@@ -1,71 +1,14 @@
 import jax
 import jax.numpy as jnp
-from numpyro.infer import Predictive
-from numpyro.infer.util import transform_fn, get_potential_fn, _get_model_transforms
-from numpyro.handlers import seed
+from jax import vmap
 from functools import partial
+from typing import Callable
 from abc import ABC, abstractmethod
 from collections import namedtuple
-import operator
+from numpyro.infer import Predictive
+from numpyro.infer.util import transform_fn, constrain_fn as replay_constrain_fn
 
-from .util import ravel_batched_pytree, compute_split_log_probs, value_and_jac
-
-
-def _parse_model(model, model_args, model_kwargs):
-    """
-    Get transformation and density functions for the model. Transformation functions are vectorized, density functions are not.
-
-    Args:
-        model: NumPyro model function
-        model_args: Positional arguments for the model
-        model_kwargs: Keyword arguments for the model
-
-    Returns:
-        Tuple of (constrain_fn, unconstrain_fn, postprocess_fn, split_log_probs_fn, model_trace)
-    """
-    # get inverse transforms (constrained -> unconstrained)
-    (inv_transforms, replay_model, has_enumerate_support, model_trace) = (
-        _get_model_transforms(seed(model, jax.random.key(0)), model_args, model_kwargs)
-    )
-    # Create forward transforms (unconstrained -> constrained)
-    forward_transforms = {k: v.inv for k, v in inv_transforms.items()}
-
-    # Create function to transform full dict
-    constrain_fn = partial(transform_fn, inv_transforms)
-    unconstrain_fn = partial(transform_fn, forward_transforms)
-
-    def split_log_probs_fn(sample):
-        log_probs_per_site = compute_split_log_probs(
-            model,
-            model_args=model_args,
-            model_kwargs=model_kwargs,
-            params_unconstrained=sample,
-            model_inv_transforms=inv_transforms,
-            sum_log_prob=True,
-        )[0]
-        # sum over sites
-        return jax.tree.reduce(operator.add, log_probs_per_site)
-
-    _, postprocess_fn = get_potential_fn(
-        model,
-        inv_transforms,
-        enum=has_enumerate_support,
-        replay_model=replay_model,
-        dynamic_args=True,
-        model_args=model_args,
-        model_kwargs=model_kwargs,
-    )
-
-    return (
-        constrain_fn,
-        unconstrain_fn,
-        postprocess_fn,
-        split_log_probs_fn,
-        model_trace,
-    )
-
-
-_parse_model_jit = jax.jit(_parse_model, static_argnames="model")
+from .util import ravel_batched_pytree, value_and_jac, parse_model, SMCModelInfo
 
 
 def _compute_mass_matrix_sqrt(raveled_particles):
@@ -85,15 +28,16 @@ class SMCKernel(ABC):
     """
 
     @abstractmethod
-    def init(self, rng_key, n_particles, model_args, model_kwargs):
+    def init(self, rng_key, n_particles, jitted, model_args, model_kwargs):
         """
         Initialize particles from the prior and return initial state.
 
         Args:
-            rng_key: JAX random key.
-            n_particles: Number of particles to initialize.
-            model_args: Positional arguments for the model.
-            model_kwargs: Keyword arguments for the model.
+            rng_key: JAX random key
+            n_particles: Number of particles to initialize
+            jitted: Whether this function is being jit compiled
+            model_args: Positional arguments for the model
+            model_kwargs: Keyword arguments for the model
 
         Returns:
             Initial SMCState (kernel-specific namedtuple).
@@ -101,13 +45,12 @@ class SMCKernel(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def mutate(self, state, beta, model_args, model_kwargs):
+    def _mutate(self, state, model_info):
         """
         Mutate all particles using the kernel's transition operator.
 
         Args:
             state: Current SMCState
-            beta: Current temperature parameter
             model_args: Positional arguments for the model
             model_kwargs: Keyword arguments for the model
 
@@ -116,7 +59,24 @@ class SMCKernel(ABC):
         """
         raise NotImplementedError
 
-    def postprocess_fn(self, model_args=(), model_kwargs=None):
+    def _parse_model(self, model_args: tuple, model_kwargs: dict) -> SMCModelInfo:
+        """
+        Lets the kernel modify the default outputs of parse_model, e.g. applying chunked vmap or value_and_grad
+
+        Args:
+            model_args (tuple): Positional arguments for the model
+            model_kwargs (dict): Keyword arguments for the model
+
+        Returns:
+            SMCModelInfo: Modified model info tuple
+        """
+        model_info = parse_model(self._model, model_args, model_kwargs)
+        return model_info._replace(
+            equivalence_mapping_fn=vmap(model_info.equivalence_mapping_fn),
+            split_log_probs_fn=vmap(model_info.split_log_probs_fn),
+        )
+
+    def postprocess_fn(self, model_args: tuple, model_kwargs: dict):
         """
         Get function that transforms unconstrained particles to constrained space.
 
@@ -127,34 +87,64 @@ class SMCKernel(ABC):
         Returns:
             Function that constrains particles
         """
-        if model_kwargs is None:
-            model_kwargs = {}
-
-        _, _, postprocess_fn_, _, _ = _parse_model(
-            self._model, model_args, model_kwargs
+        return partial(
+            replay_constrain_fn,
+            self._model,
+            model_args,
+            model_kwargs,
+            return_deterministic=True,
         )
-        return jax.vmap(postprocess_fn_(*model_args, **model_kwargs))
 
-    def multi_step_mutate(self, state, beta, model_args, model_kwargs, num_mcmc_steps):
+    def multi_step_mutate(
+        self,
+        state,
+        beta: float,
+        num_mcmc_steps: int,
+        jitted: bool,
+        model_args: tuple,
+        model_kwargs: dict,
+    ):
         """
         Apply multiple mutation steps. Default implementation calls mutate repeatedly.
-        Kernels can override for optimizations (e.g., reusing mass matrix).
+        Kernels can overwrite for optimizations (e.g., reusing mass matrix).
 
         Args:
             state: Current SMCState
             beta: Temperature parameter
+            num_mcmc_steps: Number of MCMC steps to perform
+            jitted: Whether this function is being jit compiled
             model_args: Positional arguments for the model
             model_kwargs: Keyword arguments for the model
-            num_mcmc_steps: Number of MCMC steps to perform
 
         Returns:
             New SMCState after num_mcmc_steps mutations
         """
+        # fetch model info
+        if jitted:
+            model_info = self._parse_model(model_args, model_kwargs)
+        else:
+            model_info = self._model_info
 
+        # compute mass matrix - only once per SMC step
+        if self._adapt_mass_matrix:
+            raveled_particles, _ = ravel_batched_pytree(state.z)
+            mass_matrix_sqrt = _compute_mass_matrix_sqrt(raveled_particles)
+        else:
+            mass_matrix_sqrt = state.mass_matrix_sqrt
+
+        # mutate and apply equivalence mappings
         def mutate_step(i, state):
-            return self.mutate(state, beta, model_args, model_kwargs)
+            state_mutated = self._mutate(state, model_info)
+            return state_mutated._replace(
+                z=model_info.equivalence_mapping_fn(state_mutated.z)
+            )
 
-        return jax.lax.fori_loop(0, num_mcmc_steps, mutate_step, state)
+        return jax.lax.fori_loop(
+            0,
+            num_mcmc_steps,
+            mutate_step,
+            state._replace(beta=beta, mass_matrix_sqrt=mass_matrix_sqrt),
+        )
 
     @property
     @abstractmethod
@@ -189,11 +179,13 @@ GaussianRandomWalkMetropolisSMCState = namedtuple(
 State for GaussianRandomWalkMetropolis SMC kernel.
 
 Fields:
-    - i: iteration
+    - i: Counts the total number of MCMC steps (over all SMC steps).
     - z: Dict of unconstrained particle values
+    - beta: Current temperature parameter.
     - split_log_probs: Log likelihood values, Log prior densities, Log determinants of Jacobian transformations (n_particles,3)
     - accept_prob: Acceptance probability for current step (n_particles,)
     - mean_accept_prob: Running mean acceptance probability (scalar)
+    - mass_matrix_sqrt: Cholesky factor of the proposal covariance matrix, of shape ``(dim, dim)``.
     - rng_key: random number generator seed used for generating proposals, etc.
 """
 
@@ -215,9 +207,9 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
 
     def __init__(
         self,
-        model,
+        model: Callable,
         step_size: float = 1.0,
-        likelihood_chunk_size: int = 1000,
+        likelihood_chunk_size: int = 1024,
         adapt_mass_matrix: bool = True,
     ):
         self._model = model
@@ -225,65 +217,64 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
         self._likelihood_chunk_size = likelihood_chunk_size
         self._adapt_mass_matrix = adapt_mass_matrix
 
-        # If not jitted, these will be set during init
-        self._split_log_probs_fn = None
+        # If not jitted, this will be set during init
+        self._model_info = None
 
     @property
-    def sample_field(self):
+    def sample_field(self) -> str:
         return "z"
 
     @property
-    def resample_fields(self):
+    def resample_fields(self) -> list[str]:
         return ["z", "split_log_probs", "accept_prob"]
 
     def _parse_model(self, model_args, model_kwargs):
-        (_, unconstrain_fn, _, split_log_probs_fn_, model_trace) = _parse_model(
-            self._model, model_args, model_kwargs
-        )
-        latent_sites = [
-            name
-            for name, site in model_trace.items()
-            if site["type"] == "sample" and not site["is_observed"]
-        ]
+        model_info = parse_model(self._model, model_args, model_kwargs)
 
         def split_log_probs_fn(samples_unconstrained):
             return jax.lax.map(
-                split_log_probs_fn_,
+                model_info.split_log_probs_fn,
                 xs=samples_unconstrained,
                 batch_size=self._likelihood_chunk_size,
             )
 
-        return unconstrain_fn, split_log_probs_fn, latent_sites
-
-    def init(self, rng_key, n_particles, model_args, model_kwargs):
-        """Initialize particles from the prior."""
-        jitted = isinstance(rng_key, jax.core.Tracer)
-
-        unconstrain_fn, split_log_probs_fn, latent_sites = self._parse_model(
-            model_args, model_kwargs
+        return model_info._replace(
+            equivalence_mapping_fn=vmap(model_info.equivalence_mapping_fn),
+            split_log_probs_fn=split_log_probs_fn,
         )
+
+    def init(
+        self, rng_key, n_particles, jitted, model_args, model_kwargs
+    ) -> GaussianRandomWalkMetropolisSMCState:
+        model_info = self._parse_model(model_args, model_kwargs)
 
         # if not jitted, cache functions
         if not jitted:
-            self._split_log_probs_fn = split_log_probs_fn
+            self._model_info = model_info
 
         rng_key, init_key = jax.random.split(rng_key)
         # Sample from prior (constrained space)
         _particles_constrained = Predictive(
             self._model,
             num_samples=n_particles,
-            return_sites=latent_sites,
+            return_sites=model_info.latent_sites,
             parallel=True,
         )(init_key, *model_args, **model_kwargs)
 
         # Convert to unconstrained space
-        particles_unconstrained = unconstrain_fn(_particles_constrained)
+        particles_unconstrained = vmap(
+            partial(transform_fn, model_info.inv_transforms, invert=True)
+        )(_particles_constrained)
+        # Apply equivalence mappings
+        particles_unconstrained = model_info.equivalence_mapping_fn(
+            particles_unconstrained
+        )
 
         # Compute initial density factors
         # split_log_prob_fn returns [log_likelihood, log_prior, log_det]
-        split_log_probs = split_log_probs_fn(particles_unconstrained)
+        split_log_probs = model_info.split_log_probs_fn(particles_unconstrained)
 
-        # Initialize mass matrix
+        # Initialize mass matrix as identity; will be ovewritten by mutate if adapt_mass_matrix is True
         raveled_particles, _ = ravel_batched_pytree(particles_unconstrained)
         mass_matrix_sqrt = jnp.eye(raveled_particles.shape[1], dtype=jnp.float32)
 
@@ -298,18 +289,18 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
             rng_key=rng_key,
         )
 
-    def mutate(self, state, beta, model_args, model_kwargs):
+    def _mutate(
+        self, state: GaussianRandomWalkMetropolisSMCState, model_info: SMCModelInfo
+    ) -> GaussianRandomWalkMetropolisSMCState:
         """
         Mutate particles using Gaussian random walk Metropolis-Hastings.
 
         Args:
             state: Current GaussianRandomWalkMetropolisState
-            beta: Temperature parameter
-            model_args: Positional arguments for the model
-            model_kwargs: Keyword arguments for the model
+            model_info: Parsed model info containing the split log probs function.
 
         Returns:
-            New GaussianRandomWalkMetropolisState
+            Updated GaussianRandomWalkMetropolisState
         """
         # unpack state
         step = state.i
@@ -317,16 +308,11 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
         split_log_probs = state.split_log_probs
         rng_key = state.rng_key
 
-        jitted = isinstance(rng_key, jax.core.Tracer)
-        if jitted:
-            (_, split_log_probs_fn, _) = self._parse_model(model_args, model_kwargs)
-        # if not jitted, fetch from cache
-        else:
-            split_log_probs_fn = self._split_log_probs_fn
-
         # Compute current potential energies
         potential_energies = -(
-            split_log_probs[:, 2] + split_log_probs[:, 1] + beta * split_log_probs[:, 0]
+            split_log_probs[:, 2]
+            + split_log_probs[:, 1]
+            + state.beta * split_log_probs[:, 0]
         )
 
         # Split rng key
@@ -336,26 +322,23 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
         raveled_particles, unravel_fn = ravel_batched_pytree(particles_unconstrained)
         n_particles, dim = raveled_particles.shape
 
-        if self._adapt_mass_matrix:
-            mass_matrix_sqrt = _compute_mass_matrix_sqrt(raveled_particles)
-        else:
-            mass_matrix_sqrt = state.mass_matrix_sqrt
-
         # Sample noise and apply mass matrix
         noise = jax.random.normal(mutation_key, (n_particles, dim))
         raveled_prop = raveled_particles + self._step_size * (
-            noise @ mass_matrix_sqrt.T
+            noise @ state.mass_matrix_sqrt.T
         )
         particles_unconstrained_prop = unravel_fn(raveled_prop)
 
         # Compute log densities for proposed particles
         # split_log_prob_fn returns [log_likelihood, log_prior, log_det]
-        split_log_probs_prop = split_log_probs_fn(particles_unconstrained_prop)
+        split_log_probs_prop = model_info.split_log_probs_fn(
+            particles_unconstrained_prop
+        )
 
         potential_energies_prop = -(
             split_log_probs_prop[:, 2]
             + split_log_probs_prop[:, 1]
-            + beta * split_log_probs_prop[:, 0]
+            + state.beta * split_log_probs_prop[:, 0]
         )
 
         # Metropolis-Hastings accept/reject
@@ -379,14 +362,12 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
             jnp.mean(accept_prob) - state.mean_accept_prob
         ) / (step + 1)
 
-        return GaussianRandomWalkMetropolisSMCState(
+        return state._replace(
             i=step + 1,
             z=particles_new,
-            beta=beta,
             split_log_probs=split_log_probs_new,
             accept_prob=accept_prob,
             mean_accept_prob=mean_accept_prob,
-            mass_matrix_sqrt=mass_matrix_sqrt,
             rng_key=rng_key,
         )
 
@@ -410,12 +391,14 @@ LangevinMetropolisSMCState = namedtuple(
 State for LangevinMetropolis SMC kernel.
 
 Fields:
-    - i: iteration
+    - i: Counts the total number of MCMC steps (over all SMC steps).
     - z: Dict of unconstrained particle values
-    - split_log_probs: Log determinants of Jacobian transformations (n_particles,)
-    - grad_split_log_probs: Gradients of log determinants w.r.t. unconstrained params
+    - beta: Current temperature parameter.
+    - split_log_probs: Log likelihood values, log prior densities, log determinants of Jacobian transformations (n_particles,3)
+    - grad_split_log_probs: Gradients of log likelihood values, log prior densities, log determinants w.r.t. unconstrained params
     - accept_prob: Acceptance probability for current step (n_particles,)
     - mean_accept_prob: Running mean acceptance probability (scalar)
+    - mass_matrix_sqrt: Cholesky factor of the proposal covariance matrix, of shape ``(dim, dim)``.
     - rng_key: random number generator seed used for generating proposals, etc.
 """
 
@@ -429,16 +412,19 @@ class LangevinMetropolisSMC(SMCKernel):
 
     Args:
         model: NumPyro model function
-        step_size: Step size for proposals
-        likelihood_chunk_size: Chunk size for batched likelihood computation
-        adapt_mass_matrix: Whether to adapt a mass matrix for proposal adaption
+        step_size: Step size for the Langevin proposal
+        likelihood_chunk_size: Number of particles to process at a time when
+            evaluating the log-density and its Jacobian. Smaller values reduce
+            peak memory usage.
+        adapt_mass_matrix: If ``True``, the mass matrix is updated once per SMC
+            step from the empirical covariance of the current particle cloud.
     """
 
     def __init__(
         self,
-        model,
+        model: Callable,
         step_size: float = 1.0,
-        likelihood_chunk_size: int = 1000,
+        likelihood_chunk_size: int = 1024,
         adapt_mass_matrix: bool = True,
     ):
         self._model = model
@@ -447,74 +433,73 @@ class LangevinMetropolisSMC(SMCKernel):
         self._adapt_mass_matrix = adapt_mass_matrix
 
         # If not jitted, these will be set during init
-        self._split_log_prob_and_grad_fn = None
+        self._model_info = None
 
     @property
-    def sample_field(self):
+    def sample_field(self) -> str:
         return "z"
 
     @property
-    def resample_fields(self):
-        return [
-            "z",
-            "split_log_probs",
-            "grad_split_log_probs",
-            "accept_prob",
-        ]
+    def resample_fields(self) -> list[str]:
+        return ["z", "split_log_probs", "grad_split_log_probs", "accept_prob"]
 
-    def _parse_model(self, model_args, model_kwargs):
-        (_, unconstrain_fn, _, split_log_probs_fn_, model_trace) = _parse_model(
-            self._model, model_args, model_kwargs
-        )
-        latent_sites = [
-            name
-            for name, site in model_trace.items()
-            if site["type"] == "sample" and not site["is_observed"]
-        ]
+    def _parse_model(self, model_args: tuple, model_kwargs: dict) -> SMCModelInfo:
+        """split_log_probs_fn returns value and jacobian."""
+        model_info = parse_model(self._model, model_args, model_kwargs)
 
-        def split_log_probs_and_grad_fn(samples_unconstrained):
+        def split_log_probs_and_grad_fn(
+            samples_unconstrained: dict,
+        ) -> tuple[jax.Array, jax.Array]:
             return jax.lax.map(
-                value_and_jac(split_log_probs_fn_),
+                value_and_jac(model_info.split_log_probs_fn),
                 xs=samples_unconstrained,
                 batch_size=self._likelihood_chunk_size,
             )
 
-        return unconstrain_fn, split_log_probs_and_grad_fn, latent_sites
-
-    def init(self, rng_key, n_particles, model_args, model_kwargs):
-        """Initialize particles from the prior."""
-        jitted = isinstance(rng_key, jax.core.Tracer)
-
-        # Get model functions
-        unconstrain_fn, split_log_probs_and_grad_fn, latent_sites = self._parse_model(
-            model_args, model_kwargs
+        return model_info._replace(
+            equivalence_mapping_fn=vmap(model_info.equivalence_mapping_fn),
+            split_log_probs_fn=split_log_probs_and_grad_fn,
         )
+
+    def init(
+        self,
+        rng_key,
+        n_particles: int,
+        jitted: bool,
+        model_args: tuple,
+        model_kwargs: dict,
+    ) -> LangevinMetropolisSMCState:
+        model_info = self._parse_model(model_args, model_kwargs)
 
         # if not jitted, cache functions
         if not jitted:
-            self._split_log_probs_and_grad_fn = split_log_probs_and_grad_fn
+            self._model_info = model_info
 
         rng_key, init_key = jax.random.split(rng_key)
 
         # Sample from prior (constrained space)
-        particles_constrained = Predictive(
+        _particles_constrained = Predictive(
             self._model,
             num_samples=n_particles,
-            return_sites=latent_sites,
+            return_sites=model_info.latent_sites,
             parallel=True,
         )(init_key, *model_args, **model_kwargs)
 
         # Convert to unconstrained space
-        particles_unconstrained = unconstrain_fn(particles_constrained)
-
-        # Compute initial density factors and gradients
-        # split_log_prob_and_grad_fn returns (log_probs, grad_log_probs)
-        # where log_probs = [log_likelihood, log_prior, log_det]
-        split_log_probs, grad_split_log_probs = split_log_probs_and_grad_fn(
+        particles_unconstrained = vmap(
+            partial(transform_fn, model_info.inv_transforms, invert=True)
+        )(_particles_constrained)
+        # Apply equivalence mappings
+        particles_unconstrained = model_info.equivalence_mapping_fn(
             particles_unconstrained
         )
 
-        # Initialize mass matrix
+        # Compute initial density factors and gradients
+        split_log_probs, grad_split_log_probs = model_info.split_log_probs_fn(
+            particles_unconstrained
+        )
+
+        # Initialize mass matrix as identity; will be ovewritten by mutate if adapt_mass_matrix is True
         raveled_particles, _ = ravel_batched_pytree(particles_unconstrained)
         mass_matrix_sqrt = jnp.eye(raveled_particles.shape[1], dtype=jnp.float32)
 
@@ -530,18 +515,20 @@ class LangevinMetropolisSMC(SMCKernel):
             rng_key=rng_key,
         )
 
-    def mutate(self, state, beta, model_args, model_kwargs):
+    def _mutate(
+        self,
+        state: LangevinMetropolisSMCState,
+        model_info: SMCModelInfo,
+    ) -> LangevinMetropolisSMCState:
         """
-        Mutate particles using Langevin Metropolis-Hastings with optional mass matrix.
+        Mutate particles using Langevin Metropolis-Hastings.
 
         Args:
-            state: Current LangevinMetropolisState
-            beta: Temperature parameter
-            model_args: Positional arguments for the model
-            model_kwargs: Keyword arguments for the model
+            state: Current LangevinMetropolisSMCState
+            model_info: Parsed model info containing the split log probs function.
 
         Returns:
-            New LangevinMetropolisState
+            Updated LangevinMetropolisSMCState
         """
         step = state.i
         particles_unconstrained = state.z
@@ -549,16 +536,7 @@ class LangevinMetropolisSMC(SMCKernel):
         grad_split_log_probs = state.grad_split_log_probs
         rng_key = state.rng_key
 
-        jitted = isinstance(rng_key, jax.core.Tracer)
-
-        if jitted:
-            (_, split_log_prob_and_grad_fn, _) = self._parse_model(
-                model_args, model_kwargs
-            )
-        # if not jitted, fetch from cache
-        else:
-            split_log_prob_and_grad_fn = self._split_log_prob_and_grad_fn
-
+        mass_matrix = state.mass_matrix_sqrt @ state.mass_matrix_sqrt.T
         step_size = self._step_size
 
         # Ravel particles and gradients
@@ -566,29 +544,23 @@ class LangevinMetropolisSMC(SMCKernel):
         raveled_grad_split_log_probs, _ = ravel_batched_pytree(
             grad_split_log_probs, batch_ndims=2
         )
-
         n_particles, dim = raveled_particles.shape
 
-        # Compute mass matrix
-        if self._adapt_mass_matrix:
-            mass_matrix_sqrt = _compute_mass_matrix_sqrt(raveled_particles)
-        else:
-            mass_matrix_sqrt = state.mass_matrix_sqrt
-        mass_matrix = mass_matrix_sqrt @ mass_matrix_sqrt.T
-
-        # Compute current gradients using saved components and new beta
+        # Compute current gradients using saved components and current beta
+        # Possible since tempered likelihood gradient scales linearly with beta
         raveled_grads = (
             raveled_grad_split_log_probs[:, 2]
             + raveled_grad_split_log_probs[:, 1]
-            + beta * raveled_grad_split_log_probs[:, 0]
+            + state.beta * raveled_grad_split_log_probs[:, 0]
         )
 
         # Compute current potential energies
         potential_energies = -(
-            split_log_probs[:, 2] + split_log_probs[:, 1] + beta * split_log_probs[:, 0]
+            split_log_probs[:, 2]
+            + split_log_probs[:, 1]
+            + state.beta * split_log_probs[:, 0]
         )
 
-        # Split rng key
         rng_key, acceptance_key, mutation_key = jax.random.split(rng_key, 3)
 
         # Propose new particles via Langevin dynamics with mass matrix
@@ -598,37 +570,36 @@ class LangevinMetropolisSMC(SMCKernel):
         noise = (
             step_size
             * jax.random.normal(mutation_key, (n_particles, dim))
-            @ mass_matrix_sqrt.T
+            @ state.mass_matrix_sqrt.T
         )
         raveled_prop = mean_prop + noise
         particles_unconstrained_prop = unravel_fn(raveled_prop)
 
         # Compute log densities and gradients for proposed particles
-        split_log_probs_prop, grad_split_log_probs_prop = split_log_prob_and_grad_fn(
+        split_log_probs_prop, grad_split_log_probs_prop = model_info.split_log_probs_fn(
             particles_unconstrained_prop
         )
 
         # Ravel proposed gradients
-        raveled_grad_log_probs_prop, _ = ravel_batched_pytree(
+        raveled_grad_split_log_probs_prop, _ = ravel_batched_pytree(
             grad_split_log_probs_prop, batch_ndims=2
         )
-
         raveled_grads_prop = (
-            raveled_grad_log_probs_prop[:, 2]
-            + raveled_grad_log_probs_prop[:, 1]
-            + beta * raveled_grad_log_probs_prop[:, 0]
+            raveled_grad_split_log_probs_prop[:, 2]
+            + raveled_grad_split_log_probs_prop[:, 1]
+            + state.beta * raveled_grad_split_log_probs_prop[:, 0]
         )
 
         potential_energies_prop = -(
             split_log_probs_prop[:, 2]
             + split_log_probs_prop[:, 1]
-            + beta * split_log_probs_prop[:, 0]
+            + state.beta * split_log_probs_prop[:, 0]
         )
 
-        # Compute proposal log probabilities (Gaussian with drift and mass matrix)
-        # Forward: q(x_prop | x) = N(x_prop | x + (step_size^2/2)*M*grad, step_size^2*M)
-        # Reverse: q(x | x_prop) = N(x | x_prop + (step_size^2/2)*M*grad_prop, step_size^2*M)
-        proposal_log_prob = jax.vmap(
+        # Asymmetric MH correction for the Langevin proposal
+        # Forward:  q(x' | x)     = N(x'  | x   + (h²/2) M ∇log p_β(x),     h² M)
+        # Reverse:  q(x  | x')    = N(x   | x'  + (h²/2) M ∇log p_β(x'),    h² M)
+        proposal_log_prob = vmap(
             partial(
                 jax.scipy.stats.multivariate_normal.logpdf,
                 cov=step_size**2 * mass_matrix,
@@ -643,7 +614,6 @@ class LangevinMetropolisSMC(SMCKernel):
         )
         log_reverse_prop_density = proposal_log_prob(raveled_particles, reverse_mean)
 
-        # Metropolis-Hastings accept/reject with proposal correction
         log_accept_ratio = (
             potential_energies
             - potential_energies_prop
@@ -684,14 +654,12 @@ class LangevinMetropolisSMC(SMCKernel):
             jnp.mean(accept_prob) - state.mean_accept_prob
         ) / (step + 1)
 
-        return LangevinMetropolisSMCState(
+        return state._replace(
             i=step + 1,
             z=particles_new,
-            beta=beta,
             split_log_probs=split_log_probs_new,
             grad_split_log_probs=grad_split_log_probs_new,
             accept_prob=accept_prob,
             mean_accept_prob=mean_accept_prob,
-            mass_matrix_sqrt=mass_matrix_sqrt,
             rng_key=rng_key,
         )
