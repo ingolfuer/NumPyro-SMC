@@ -46,13 +46,23 @@ def test_smc():
         if use_second_factor:
             numpyro.sample("y2", dist.Normal(coeff * x, 2), obs=3)
 
+    def test_model_6():
+        x = numpyro.sample(
+            "x",
+            dist.Normal(loc=0, scale=1000),
+            infer={"equivalence_mapping": lambda x: x % (2 * np.pi)},
+        )
+        numpyro.factor("y", 10 * jnp.cos(x))
+
     n_steps = 20
     rng_key = jax.random.key(6)
 
+    # for model in [test_model_6]:
     for model in [test_model_1, test_model_2, test_model_3, test_model_4, test_model_5]:
+        # for kernel_type in [LangevinMetropolisSMC]:
         for kernel_type in [GaussianRandomWalkMetropolisSMC, LangevinMetropolisSMC]:
             print(model.__name__, kernel_type.__name__)
-            kernel = kernel_type(model, step_size=1, likelihood_chunk_size=3200)
+            kernel = kernel_type(model, step_size=0.3, likelihood_chunk_size=3200)
             samples, extra = sample_SMC(
                 kernel,
                 num_chains=4,
@@ -68,9 +78,9 @@ def test_smc():
                 jit_sample_fn=True,
             )
 
-            idata = az.from_dict(posterior=samples)
+            idata = az.from_dict(dict(posterior=samples))
             print(idata.posterior.x.mean().values)
-            az.plot_trace(idata)
+            az.plot_trace_dist(idata)
             plt.tight_layout()
             plt.show()
 
@@ -83,8 +93,8 @@ def test_smc():
             chain_method="vectorized",
         )
         mcmc.run(rng_key)
-        idata = az.from_dict(posterior=mcmc.get_samples(group_by_chain=True))
+        idata = az.from_dict(dict(posterior=mcmc.get_samples(group_by_chain=True)))
         print(idata.posterior.x.mean().values)
-        az.plot_trace(idata)
+        az.plot_trace_dist(idata)
         plt.tight_layout()
         plt.show()
