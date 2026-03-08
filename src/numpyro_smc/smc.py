@@ -291,10 +291,10 @@ def sample_SMC(
             print(f"done (took {perf_counter()-start}s)")
 
     # Create init_fn and step_fn with parameters bound via partial
-    init_fn = jax.tree_util.Partial(
+    init_fn = partial(
         base_init, kernel, num_particles, jit_sample_fn, model_args, model_kwargs
     )
-    step_fn = jax.tree_util.Partial(
+    step_fn = partial(
         base_step,
         kernel,
         num_mcmc_steps,

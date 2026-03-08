@@ -87,12 +87,14 @@ class SMCKernel(ABC):
         Returns:
             Function that constrains particles
         """
-        return partial(
-            replay_constrain_fn,
-            self._model,
-            model_args,
-            model_kwargs,
-            return_deterministic=True,
+        return vmap(
+            partial(
+                replay_constrain_fn,
+                self._model,
+                model_args,
+                model_kwargs,
+                return_deterministic=True,
+            )
         )
 
     def multi_step_mutate(
@@ -125,12 +127,22 @@ class SMCKernel(ABC):
         else:
             model_info = self._model_info
 
-        # compute mass matrix - only once per SMC step
-        if self._adapt_mass_matrix:
+        if self.adapt_step:
+            # compute mass matrix
             raveled_particles, _ = ravel_batched_pytree(state.z)
             mass_matrix_sqrt = _compute_mass_matrix_sqrt(raveled_particles)
+
+            # adapt step size
+            intercept = jnp.log(
+                state.step_size
+            ) / self.adaption_gain + jax.scipy.special.logit(state.mean_accept_prob)
+            step_size = jnp.exp(
+                self.adaption_gain
+                * (intercept - jax.scipy.special.logit(self.target_accept_prob))
+            )
         else:
             mass_matrix_sqrt = state.mass_matrix_sqrt
+            step_size = state.step_size
 
         # mutate and apply equivalence mappings
         def mutate_step(i, state):
@@ -143,8 +155,26 @@ class SMCKernel(ABC):
             0,
             num_mcmc_steps,
             mutate_step,
-            state._replace(beta=beta, mass_matrix_sqrt=mass_matrix_sqrt),
+            state._replace(
+                i=jnp.array(0, dtype=jnp.int32),
+                beta=beta,
+                mass_matrix_sqrt=mass_matrix_sqrt,
+                step_size=step_size,
+                mean_accept_prob=jnp.array(0.0, dtype=jnp.float32),
+            ),
         )
+
+    @property
+    def target_accept_prob(self):
+        return self._target_accept_prob
+
+    @property
+    def adapt_step(self):
+        return self._adapt_step
+
+    @property
+    def adaption_gain(self):
+        return self._adaption_gain
 
     @property
     @abstractmethod
@@ -172,6 +202,7 @@ GaussianRandomWalkMetropolisSMCState = namedtuple(
         "accept_prob",
         "mean_accept_prob",
         "mass_matrix_sqrt",
+        "step_size",
         "rng_key",
     ],
 )
@@ -186,6 +217,7 @@ Fields:
     - accept_prob: Acceptance probability for current step (n_particles,)
     - mean_accept_prob: Running mean acceptance probability (scalar)
     - mass_matrix_sqrt: Cholesky factor of the proposal covariance matrix, of shape ``(dim, dim)``.
+    - step_size: Scalar step size for the proposal.
     - rng_key: random number generator seed used for generating proposals, etc.
 """
 
@@ -199,23 +231,31 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
 
     Args:
         model: NumPyro model function
-        step_size: Step size for proposals.
-        likelihood_chunk_size: Chunk size for batched likelihood computation
-        adapt_mass_matrix: Whether to adapt a mass matrix for proposal adaption.
+        init_step_size: Initial step size for proposals.
+        target_accept_prob: Target acceptance probability for step size adaption. Has no effect if ``adapt_step=False``.
+        likelihood_chunk_size: Chunk size for batched likelihood computation.
+        adapt_step: Whether to adapt the proposal step size and mass matrix. Mass matrix is updated from
+            the empirical covariance of the current particle cloud. Step size is updated based on target
+            acceptance probability and mean acceptance probability in the last SMC step. Update is done once
+            per SMC step.
 
     """
 
     def __init__(
         self,
         model: Callable,
-        step_size: float = 1.0,
+        init_step_size: float = 1.0,
+        target_accept_prob: float = 0.3,
         likelihood_chunk_size: int = 1024,
-        adapt_mass_matrix: bool = True,
+        adapt_step: bool = True,
+        adaption_gain: float = 0.89,
     ):
         self._model = model
-        self._step_size = step_size
+        self._init_step_size = init_step_size
+        self._target_accept_prob = target_accept_prob
         self._likelihood_chunk_size = likelihood_chunk_size
-        self._adapt_mass_matrix = adapt_mass_matrix
+        self._adapt_step = adapt_step
+        self._adaption_gain = adaption_gain
 
         # If not jitted, this will be set during init
         self._model_info = None
@@ -274,7 +314,7 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
         # split_log_prob_fn returns [log_likelihood, log_prior, log_det]
         split_log_probs = model_info.split_log_probs_fn(particles_unconstrained)
 
-        # Initialize mass matrix as identity; will be ovewritten by mutate if adapt_mass_matrix is True
+        # Initialize mass matrix as identity; will be ovewritten by mutate if adapt_step is True
         raveled_particles, _ = ravel_batched_pytree(particles_unconstrained)
         mass_matrix_sqrt = jnp.eye(raveled_particles.shape[1], dtype=jnp.float32)
 
@@ -284,8 +324,9 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
             beta=jnp.array(0.0, dtype=jnp.float32),
             split_log_probs=split_log_probs,
             accept_prob=jnp.zeros(n_particles, dtype=jnp.float32),
-            mean_accept_prob=jnp.array(0.0, dtype=jnp.float32),
+            mean_accept_prob=jnp.array(self.target_accept_prob, dtype=jnp.float32),
             mass_matrix_sqrt=mass_matrix_sqrt,
+            step_size=jnp.array(self._init_step_size, dtype=jnp.float32),
             rng_key=rng_key,
         )
 
@@ -324,7 +365,7 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
 
         # Sample noise and apply mass matrix
         noise = jax.random.normal(mutation_key, (n_particles, dim))
-        raveled_prop = raveled_particles + self._step_size * (
+        raveled_prop = raveled_particles + state.step_size * (
             noise @ state.mass_matrix_sqrt.T
         )
         particles_unconstrained_prop = unravel_fn(raveled_prop)
@@ -384,6 +425,7 @@ LangevinMetropolisSMCState = namedtuple(
         "accept_prob",
         "mean_accept_prob",
         "mass_matrix_sqrt",
+        "step_size",
         "rng_key",
     ],
 )
@@ -399,6 +441,7 @@ Fields:
     - accept_prob: Acceptance probability for current step (n_particles,)
     - mean_accept_prob: Running mean acceptance probability (scalar)
     - mass_matrix_sqrt: Cholesky factor of the proposal covariance matrix, of shape ``(dim, dim)``.
+    - step_size: Scalar step size for the proposal.
     - rng_key: random number generator seed used for generating proposals, etc.
 """
 
@@ -411,26 +454,32 @@ class LangevinMetropolisSMC(SMCKernel):
     then accepts/rejects using Metropolis-Hastings criterion with proposal correction.
 
     Args:
+
         model: NumPyro model function
-        step_size: Step size for the Langevin proposal
-        likelihood_chunk_size: Number of particles to process at a time when
-            evaluating the log-density and its Jacobian. Smaller values reduce
-            peak memory usage.
-        adapt_mass_matrix: If ``True``, the mass matrix is updated once per SMC
-            step from the empirical covariance of the current particle cloud.
+        init_step_size: Initial step size for proposals.
+        target_accept_prob: Target acceptance probability for step size adaption. Has no effect if ``adapt_step=False``.
+        likelihood_chunk_size: Chunk size for batched likelihood computation.
+        adapt_step: Whether to adapt the proposal step size and mass matrix. Mass matrix is updated from
+            the empirical covariance of the current particle cloud. Step size is updated based on target
+            acceptance probability and mean acceptance probability in the last SMC step. Update is done once
+            per SMC step.
     """
 
     def __init__(
         self,
         model: Callable,
-        step_size: float = 1.0,
+        init_step_size: float = 1.0,
+        target_accept_prob: float = 0.574,
         likelihood_chunk_size: int = 1024,
-        adapt_mass_matrix: bool = True,
+        adapt_step: bool = True,
+        adaption_gain: float = 0.3,
     ):
         self._model = model
-        self._step_size = step_size
+        self._init_step_size = init_step_size
+        self._target_accept_prob = target_accept_prob
         self._likelihood_chunk_size = likelihood_chunk_size
-        self._adapt_mass_matrix = adapt_mass_matrix
+        self._adapt_step = adapt_step
+        self._adaption_gain = adaption_gain
 
         # If not jitted, these will be set during init
         self._model_info = None
@@ -499,7 +548,7 @@ class LangevinMetropolisSMC(SMCKernel):
             particles_unconstrained
         )
 
-        # Initialize mass matrix as identity; will be ovewritten by mutate if adapt_mass_matrix is True
+        # Initialize mass matrix as identity; will be ovewritten by mutate if adapt_step is True
         raveled_particles, _ = ravel_batched_pytree(particles_unconstrained)
         mass_matrix_sqrt = jnp.eye(raveled_particles.shape[1], dtype=jnp.float32)
 
@@ -510,8 +559,9 @@ class LangevinMetropolisSMC(SMCKernel):
             split_log_probs=split_log_probs,
             grad_split_log_probs=grad_split_log_probs,
             accept_prob=jnp.zeros(n_particles, dtype=jnp.float32),
-            mean_accept_prob=jnp.array(0.0, dtype=jnp.float32),
+            mean_accept_prob=jnp.array(self.target_accept_prob, dtype=jnp.float32),
             mass_matrix_sqrt=mass_matrix_sqrt,
+            step_size=jnp.array(self._init_step_size, dtype=jnp.float32),
             rng_key=rng_key,
         )
 
@@ -537,7 +587,7 @@ class LangevinMetropolisSMC(SMCKernel):
         rng_key = state.rng_key
 
         mass_matrix = state.mass_matrix_sqrt @ state.mass_matrix_sqrt.T
-        step_size = self._step_size
+        step_size = state.step_size
 
         # Ravel particles and gradients
         raveled_particles, unravel_fn = ravel_batched_pytree(particles_unconstrained)

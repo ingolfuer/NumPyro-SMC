@@ -6,11 +6,7 @@ from typing import Any, Callable, TypeAlias
 from functools import partial
 from collections import namedtuple
 import operator
-from numpyro.infer.util import (
-    transform_fn,
-    _get_model_transforms,
-    constrain_fn as replay_constrain_fn,
-)
+from numpyro.infer.util import transform_fn, _get_model_transforms
 from numpyro.util import identity
 
 from jax._src.lax import lax
@@ -106,7 +102,7 @@ def parse_model(model: Callable, model_args: tuple, model_kwargs: dict) -> SMCMo
         model_trace=model_trace,
     )
 
-
+# TODO: merge log_prior and log_det
 def compute_split_log_probs(
     model,
     model_args: tuple,
