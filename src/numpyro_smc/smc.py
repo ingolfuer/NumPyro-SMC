@@ -95,24 +95,30 @@ _init_smc_vmapped = jax.vmap(_init_smc, in_axes=(None, None, None, None, None, 0
 def _smc_step(
     kernel: SMCKernel,
     num_mcmc_steps: int,
-    ess_threshold: float,
+    beta_schedule: jnp.ndarray | None,
+    ess_threshold: float | None,
     jitted: bool,
     model_args: tuple,
     model_kwargs: dict,
     state,
 ):
     """Single SMC step - can be scanned over."""
+    i_smc = state.i_smc
 
     def resample_and_mutate():
         log_likelihoods = state.split_log_probs[:, 0]
 
-        # Adaptive tempering: find next beta
-        beta_next = _adaptive_tempering_step(
-            log_likelihoods=log_likelihoods,
-            beta_current=state.beta,
-            ess_threshold=ess_threshold,
-        )
-        beta_next = jnp.minimum(beta_next, 1.0)
+        if beta_schedule is not None:
+            # Fixed tempering
+            beta_next = beta_schedule[i_smc]
+        else:
+            # Adaptive tempering: find next beta
+            beta_next = _adaptive_tempering_step(
+                log_likelihoods=log_likelihoods,
+                beta_current=state.beta,
+                ess_threshold=ess_threshold,
+            )
+            beta_next = jnp.minimum(beta_next, 1.0)
 
         delta_beta = beta_next - state.beta
 
@@ -142,10 +148,14 @@ def _smc_step(
     def no_op():
         return state
 
-    return jax.lax.cond(state.beta != 1.0, resample_and_mutate, no_op)
+    return jax.lax.cond(state.beta != 1.0, resample_and_mutate, no_op)._replace(
+        i_smc=i_smc + 1
+    )
 
 
-_smc_step_vmapped = jax.vmap(_smc_step, in_axes=(None, None, None, None, None, None, 0))
+_smc_step_vmapped = jax.vmap(
+    _smc_step, in_axes=(None, None, None, None, None, None, None, 0)
+)
 
 
 def _smc_loop(
@@ -161,7 +171,6 @@ def _smc_loop(
     init_state = init_fn(rng_key)
 
     # Prepare collection fields
-    assert isinstance(extra_fields, (tuple, list))
     collect_fields = tuple(extra_fields) if extra_fields else ()
 
     # Transform function for fori_collect
@@ -201,7 +210,8 @@ def sample_SMC(
     num_particles: int = 500,
     num_steps: int = 10,
     num_mcmc_steps: int = 1,
-    ess_threshold: float = 0.5,
+    beta_schedule: jnp.ndarray | None = None,
+    ess_threshold: float | None = 0.5,
     model_args=(),
     model_kwargs=None,
     rng_key=jax.random.key(0),
@@ -219,7 +229,11 @@ def sample_SMC(
         num_particles: Number of particles (per chain)
         num_steps: Maximum number of SMC steps
         num_mcmc_steps: Number of MCMC steps per SMC step
-        ess_threshold: ESS threshold as fraction of num_particles for adaptive tempering
+        beta_schedule: Array of tempering factors used in each SMC step. Length must be num_steps.
+            Tempering factor at initialization is always 0 and must not be passed here.
+            Exactly one of ess_threshold and beta_schedule must be passed.
+        ess_threshold: ESS threshold as fraction of num_particles for adaptive tempering.
+            Exactly one of ess_threshold and beta_schedule must be passed.
         model_args: Tuple of model arguments (must be JAX-compatible)
         model_kwargs: Dict of model keyword arguments (must be JAX-compatible)
         rng_key: JAX random key
@@ -238,8 +252,8 @@ def sample_SMC(
         model_kwargs = {}
     rng_keys = random.split(rng_key, num_chains)
 
-    # Validate extra_fields
-    assert isinstance(extra_fields, (tuple))
+    if not ((beta_schedule is None) ^ (ess_threshold is None)):
+        raise ValueError("Exactly one of beta_schedule or ess_threshold must be None.")
 
     if num_chains == 1:
         chain_method = "sequential"
@@ -281,6 +295,7 @@ def sample_SMC(
         base_step.lower(
             kernel,
             num_mcmc_steps,
+            beta_schedule,
             ess_threshold,
             jit_sample_fn,
             model_args,
@@ -298,6 +313,7 @@ def sample_SMC(
         base_step,
         kernel,
         num_mcmc_steps,
+        beta_schedule,
         ess_threshold,
         jit_sample_fn,
         model_args,
@@ -335,4 +351,4 @@ def sample_SMC(
     else:
         states = ret
         particles_constrained = postprocess_fn(states.z)
-        return particles_constrained
+        return particles_constrained, {}

@@ -196,6 +196,7 @@ GaussianRandomWalkMetropolisSMCState = namedtuple(
     "GaussianRandomWalkMetropolisSMCState",
     [
         "i",
+        "i_smc",
         "z",
         "beta",
         "split_log_probs",
@@ -211,6 +212,7 @@ State for GaussianRandomWalkMetropolis SMC kernel.
 
 Fields:
     - i: Counts the total number of MCMC steps (over all SMC steps).
+    - i_smc: Counts the number of SMC steps.
     - z: Dict of unconstrained particle values
     - beta: Current temperature parameter.
     - split_log_probs: Log likelihood values, Log prior densities, Log determinants of Jacobian transformations (n_particles,3)
@@ -320,6 +322,7 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
 
         return GaussianRandomWalkMetropolisSMCState(
             i=jnp.array(0, dtype=jnp.int32),
+            i_smc=jnp.array(0, dtype=jnp.int32),
             z=particles_unconstrained,
             beta=jnp.array(0.0, dtype=jnp.float32),
             split_log_probs=split_log_probs,
@@ -418,6 +421,7 @@ LangevinMetropolisSMCState = namedtuple(
     "LangevinMetropolisSMCState",
     [
         "i",
+        "i_smc",
         "z",
         "beta",
         "split_log_probs",
@@ -434,6 +438,7 @@ State for LangevinMetropolis SMC kernel.
 
 Fields:
     - i: Counts the total number of MCMC steps (over all SMC steps).
+    - i_smc: Counts the number of SMC steps.
     - z: Dict of unconstrained particle values
     - beta: Current temperature parameter.
     - split_log_probs: Log likelihood values, log prior densities, log determinants of Jacobian transformations (n_particles,3)
@@ -554,6 +559,7 @@ class LangevinMetropolisSMC(SMCKernel):
 
         return LangevinMetropolisSMCState(
             i=jnp.array(0, dtype=jnp.int32),
+            i_smc=jnp.array(0, dtype=jnp.int32),
             z=particles_unconstrained,
             beta=jnp.array(0.0, dtype=jnp.float32),
             split_log_probs=split_log_probs,
