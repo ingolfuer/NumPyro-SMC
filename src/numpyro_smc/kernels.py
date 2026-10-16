@@ -11,7 +11,7 @@ from numpyro.infer.util import transform_fn, constrain_fn as replay_constrain_fn
 from .util import ravel_batched_pytree, value_and_jac, parse_model, SMCModelInfo
 
 
-def _compute_mass_matrix_sqrt(raveled_particles):
+def _compute_covariance_matrix_sqrt(raveled_particles):
     """Compute Cholesky factor of regularized empirical covariance."""
     cov = jnp.cov(raveled_particles, rowvar=False, bias=True)
     cov = jnp.atleast_2d(cov)
@@ -130,7 +130,7 @@ class SMCKernel(ABC):
         if self.adapt_step:
             # compute mass matrix
             raveled_particles, _ = ravel_batched_pytree(state.z)
-            mass_matrix_sqrt = _compute_mass_matrix_sqrt(raveled_particles)
+            mass_matrix_sqrt = _compute_covariance_matrix_sqrt(raveled_particles)
 
             # adapt step size
             intercept = jnp.log(
@@ -234,7 +234,7 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
     Args:
         model: NumPyro model function
         init_step_size: Initial step size for proposals.
-        target_accept_prob: Target acceptance probability for step size adaption. Has no effect if ``adapt_step=False``.
+        target_accept_prob: Target acceptance probability for step size adaption. Has no effect if adapt_step=False.
         likelihood_chunk_size: Chunk size for batched likelihood computation.
         adapt_step: Whether to adapt the proposal step size and mass matrix. Mass matrix is updated from
             the empirical covariance of the current particle cloud. Step size is updated based on target
@@ -247,7 +247,7 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
         self,
         model: Callable,
         init_step_size: float = 1.0,
-        target_accept_prob: float = 0.3,
+        target_accept_prob: float = 0.234,
         likelihood_chunk_size: int = 1024,
         adapt_step: bool = True,
         adaption_gain: float = 0.89,
@@ -477,7 +477,7 @@ class LangevinMetropolisSMC(SMCKernel):
         target_accept_prob: float = 0.574,
         likelihood_chunk_size: int = 1024,
         adapt_step: bool = True,
-        adaption_gain: float = 0.3,
+        adaption_gain: float = 0.35,
     ):
         self._model = model
         self._init_step_size = init_step_size
