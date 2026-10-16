@@ -15,7 +15,7 @@ def _compute_covariance_matrix_sqrt(raveled_particles):
     """Compute Cholesky factor of regularized empirical covariance."""
     cov = jnp.cov(raveled_particles, rowvar=False, bias=True)
     cov = jnp.atleast_2d(cov)
-    cov = cov + 1e-6 * jnp.eye(cov.shape[0], dtype=jnp.float32)
+    cov = cov + 1e-6 * jnp.eye(cov.shape[0], dtype=jnp.result_type(float))
 
     return jnp.linalg.cholesky(cov)
 
@@ -156,11 +156,11 @@ class SMCKernel(ABC):
             num_mcmc_steps,
             mutate_step,
             state._replace(
-                i=jnp.array(0, dtype=jnp.int32),
+                i=jnp.array(0, dtype=jnp.result_type(int)),
                 beta=beta,
                 mass_matrix_sqrt=mass_matrix_sqrt,
                 step_size=step_size,
-                mean_accept_prob=jnp.array(0.0, dtype=jnp.float32),
+                mean_accept_prob=jnp.array(0.0, dtype=jnp.result_type(float)),
             ),
         )
 
@@ -320,18 +320,18 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
 
         # Initialize mass matrix as identity; will be ovewritten by mutate if adapt_step is True
         raveled_particles, _ = ravel_batched_pytree(particles_unconstrained)
-        mass_matrix_sqrt = jnp.eye(raveled_particles.shape[1], dtype=jnp.float32)
+        mass_matrix_sqrt = jnp.eye(raveled_particles.shape[1], dtype=jnp.result_type(float))
 
         return GaussianRandomWalkMetropolisSMCState(
-            i=jnp.array(0, dtype=jnp.int32),
-            i_smc=jnp.array(0, dtype=jnp.int32),
+            i=jnp.array(0, dtype=jnp.result_type(int)),
+            i_smc=jnp.array(0, dtype=jnp.result_type(int)),
             z=particles_unconstrained,
-            beta=jnp.array(0.0, dtype=jnp.float32),
+            beta=jnp.array(0.0, dtype=jnp.result_type(float)),
             split_log_probs=split_log_probs,
-            accept_prob=jnp.zeros(n_particles, dtype=jnp.float32),
-            mean_accept_prob=jnp.array(self.target_accept_prob, dtype=jnp.float32),
+            accept_prob=jnp.zeros(n_particles, dtype=jnp.result_type(float)),
+            mean_accept_prob=jnp.array(self.target_accept_prob, dtype=jnp.result_type(float)),
             mass_matrix_sqrt=mass_matrix_sqrt,
-            step_size=jnp.array(self._init_step_size, dtype=jnp.float32),
+            step_size=jnp.array(self._init_step_size, dtype=jnp.result_type(float)),
             rng_key=rng_key,
         )
 
@@ -390,7 +390,7 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
         # Metropolis-Hastings accept/reject
         log_accept_ratio = potential_energies - potential_energies_prop
         accept_prob = jnp.minimum(
-            jnp.array(1.0, dtype=jnp.float32), jnp.exp(log_accept_ratio)
+            jnp.array(1.0, dtype=jnp.result_type(float)), jnp.exp(log_accept_ratio)
         )
 
         accept = jax.random.bernoulli(acceptance_key, p=accept_prob)
@@ -559,19 +559,19 @@ class LangevinMetropolisSMC(SMCKernel):
 
         # Initialize mass matrix as identity; will be ovewritten by mutate if adapt_step is True
         raveled_particles, _ = ravel_batched_pytree(particles_unconstrained)
-        mass_matrix_sqrt = jnp.eye(raveled_particles.shape[1], dtype=jnp.float32)
+        mass_matrix_sqrt = jnp.eye(raveled_particles.shape[1], dtype=jnp.result_type(float))
 
         return LangevinMetropolisSMCState(
-            i=jnp.array(0, dtype=jnp.int32),
-            i_smc=jnp.array(0, dtype=jnp.int32),
+            i=jnp.array(0, dtype=jnp.result_type(int)),
+            i_smc=jnp.array(0, dtype=jnp.result_type(int)),
             z=particles_unconstrained,
-            beta=jnp.array(0.0, dtype=jnp.float32),
+            beta=jnp.array(0.0, dtype=jnp.result_type(float)),
             split_log_probs=split_log_probs,
             grad_split_log_probs=grad_split_log_probs,
-            accept_prob=jnp.zeros(n_particles, dtype=jnp.float32),
-            mean_accept_prob=jnp.array(self.target_accept_prob, dtype=jnp.float32),
+            accept_prob=jnp.zeros(n_particles, dtype=jnp.result_type(float)),
+            mean_accept_prob=jnp.array(self.target_accept_prob, dtype=jnp.result_type(float)),
             mass_matrix_sqrt=mass_matrix_sqrt,
-            step_size=jnp.array(self._init_step_size, dtype=jnp.float32),
+            step_size=jnp.array(self._init_step_size, dtype=jnp.result_type(float)),
             rng_key=rng_key,
         )
 
@@ -681,7 +681,7 @@ class LangevinMetropolisSMC(SMCKernel):
             - log_forward_prop_density
         )
         accept_prob = jnp.minimum(
-            jnp.array(1.0, dtype=jnp.float32), jnp.exp(log_accept_ratio)
+            jnp.array(1.0, dtype=jnp.result_type(float)), jnp.exp(log_accept_ratio)
         )
 
         accept = jax.random.bernoulli(acceptance_key, p=accept_prob)

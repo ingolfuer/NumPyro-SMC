@@ -24,7 +24,6 @@ This is an implementation of Sequential Monte Carlo sampling for [NumPyro](https
 
 # Known Issues
 - site support depending on other site's value silently produces false results (akin to NumPyro issue #241)
-- no support for 64-bit precision
 
 # Note
 We are not aware of any theoretical or systematic empirical analysis of

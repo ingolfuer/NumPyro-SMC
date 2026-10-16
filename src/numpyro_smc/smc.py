@@ -42,7 +42,7 @@ def _adaptive_tempering_step(log_likelihoods, beta_current, ess_threshold):
 
     # Run binary search for 20 iterations
     beta_min, beta_max = jax.lax.fori_loop(
-        0, 20, binary_search_step, (beta_current, jnp.array(1.0, dtype=jnp.float32))
+        0, 20, binary_search_step, (beta_current, jnp.array(1.0, dtype=jnp.result_type(float)))
     )
 
     return beta_min
