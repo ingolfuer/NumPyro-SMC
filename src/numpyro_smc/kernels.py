@@ -40,7 +40,7 @@ class SMCKernel(ABC):
             model_kwargs: Keyword arguments for the model
 
         Returns:
-            Initial SMCState (kernel-specific namedtuple).
+            Initial `SMCState` (kernel-specific namedtuple).
         """
         raise NotImplementedError
 
@@ -50,18 +50,18 @@ class SMCKernel(ABC):
         Mutate all particles using the kernel's transition operator.
 
         Args:
-            state: Current SMCState
+            state: Current `SMCState`
             model_args: Positional arguments for the model
             model_kwargs: Keyword arguments for the model
 
         Returns:
-            New SMCState after mutation
+            New `SMCState` after mutation
         """
         raise NotImplementedError
 
     def _parse_model(self, model_args: tuple, model_kwargs: dict) -> SMCModelInfo:
         """
-        Lets the kernel modify the default outputs of parse_model, e.g. applying chunked vmap or value_and_grad
+        Lets the kernel modify the default outputs of parse_model, e.g. applying chunked vmap or `value_and_grad`
 
         Args:
             model_args (tuple): Positional arguments for the model
@@ -111,7 +111,7 @@ class SMCKernel(ABC):
         Kernels can overwrite for optimizations (e.g., reusing mass matrix).
 
         Args:
-            state: Current SMCState
+            state: Current `SMCState`
             beta: Temperature parameter
             num_mcmc_steps: Number of MCMC steps to perform
             jitted: Whether this function is being jit compiled
@@ -119,7 +119,7 @@ class SMCKernel(ABC):
             model_kwargs: Keyword arguments for the model
 
         Returns:
-            New SMCState after num_mcmc_steps mutations
+            New `SMCState` after `num_mcmc_steps` mutations
         """
         # fetch model info
         if jitted:
@@ -218,7 +218,7 @@ Fields:
     - split_log_probs: Log likelihood values, Log prior densities, Log determinants of Jacobian transformations (n_particles,3)
     - accept_prob: Acceptance probability for current step (n_particles,)
     - mean_accept_prob: Running mean acceptance probability (scalar)
-    - mass_matrix_sqrt: Cholesky factor of the proposal covariance matrix, of shape ``(dim, dim)``.
+    - mass_matrix_sqrt: Cholesky factor of the proposal covariance matrix, of shape `(dim, dim)`.
     - step_size: Scalar step size for the proposal.
     - rng_key: random number generator seed used for generating proposals, etc.
 """
@@ -234,12 +234,14 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
     Args:
         model: NumPyro model function
         init_step_size: Initial step size for proposals.
-        target_accept_prob: Target acceptance probability for step size adaption. Has no effect if adapt_step=False.
+        target_accept_prob: Target acceptance probability for step size adaption. Has no effect if `adapt_step=False`.
         likelihood_chunk_size: Chunk size for batched likelihood computation.
         adapt_step: Whether to adapt the proposal step size and mass matrix. Mass matrix is updated from
             the empirical covariance of the current particle cloud. Step size is updated based on target
             acceptance probability and mean acceptance probability in the last SMC step. Update is done once
             per SMC step.
+        adaption_gain: Controls how much the step size is adapted based on previous mean acceptance probability.
+            Has no effect if `adapt_step=False`.
 
     """
 
@@ -290,7 +292,7 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
     ) -> GaussianRandomWalkMetropolisSMCState:
         model_info = self._parse_model(model_args, model_kwargs)
 
-        # if not jitted, cache functions
+        # if not jitted, cache functions for mutate step
         if not jitted:
             self._model_info = model_info
 
@@ -340,11 +342,11 @@ class GaussianRandomWalkMetropolisSMC(SMCKernel):
         Mutate particles using Gaussian random walk Metropolis-Hastings.
 
         Args:
-            state: Current GaussianRandomWalkMetropolisState
+            state: Current `GaussianRandomWalkMetropolisState`
             model_info: Parsed model info containing the split log probs function.
 
         Returns:
-            Updated GaussianRandomWalkMetropolisState
+            Updated `GaussianRandomWalkMetropolisState`
         """
         # unpack state
         step = state.i
@@ -445,7 +447,7 @@ Fields:
     - grad_split_log_probs: Gradients of log likelihood values, log prior densities, log determinants w.r.t. unconstrained params
     - accept_prob: Acceptance probability for current step (n_particles,)
     - mean_accept_prob: Running mean acceptance probability (scalar)
-    - mass_matrix_sqrt: Cholesky factor of the proposal covariance matrix, of shape ``(dim, dim)``.
+    - mass_matrix_sqrt: Cholesky factor of the proposal covariance matrix, of shape `(dim, dim)`.
     - step_size: Scalar step size for the proposal.
     - rng_key: random number generator seed used for generating proposals, etc.
 """
@@ -462,12 +464,14 @@ class LangevinMetropolisSMC(SMCKernel):
 
         model: NumPyro model function
         init_step_size: Initial step size for proposals.
-        target_accept_prob: Target acceptance probability for step size adaption. Has no effect if ``adapt_step=False``.
+        target_accept_prob: Target acceptance probability for step size adaption. Has no effect if `adapt_step=False`.
         likelihood_chunk_size: Chunk size for batched likelihood computation.
         adapt_step: Whether to adapt the proposal step size and mass matrix. Mass matrix is updated from
             the empirical covariance of the current particle cloud. Step size is updated based on target
             acceptance probability and mean acceptance probability in the last SMC step. Update is done once
             per SMC step.
+        adaption_gain: Controls how much the step size is adapted based on previous mean acceptance probability.
+            Has no effect if `adapt_step=False`.
     """
 
     def __init__(
@@ -525,7 +529,7 @@ class LangevinMetropolisSMC(SMCKernel):
     ) -> LangevinMetropolisSMCState:
         model_info = self._parse_model(model_args, model_kwargs)
 
-        # if not jitted, cache functions
+        # if not jitted, cache functions for mutate step
         if not jitted:
             self._model_info = model_info
 
@@ -580,11 +584,11 @@ class LangevinMetropolisSMC(SMCKernel):
         Mutate particles using Langevin Metropolis-Hastings.
 
         Args:
-            state: Current LangevinMetropolisSMCState
+            state: Current `LangevinMetropolisSMCState`
             model_info: Parsed model info containing the split log probs function.
 
         Returns:
-            Updated LangevinMetropolisSMCState
+            Updated `LangevinMetropolisSMCState`
         """
         step = state.i
         particles_unconstrained = state.z

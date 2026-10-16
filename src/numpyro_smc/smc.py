@@ -53,11 +53,11 @@ def _resample_particles(state, log_weights, resample_fields):
     Resample particles and associated metadata using categorical sampling.
 
     Args:
-        state: Current SMCState namedtuple.
+        state: Current `SMCState` namedtuple.
         resample_fields: List of fields that represent per-particle data and need resampling.
 
     Returns:
-        A new SMCState with particles and scores resampled.
+        A new `SMCState` with particles and scores resampled.
     """
     num_particles = log_weights.shape[0]
     rng_key, resample_key = jax.random.split(state.rng_key)
@@ -85,7 +85,7 @@ def _init_smc(
     model_kwargs: dict,
     rng_key,
 ):
-    """Initialize SMC state using kernel.init."""
+    """Initialize SMC state using `kernel.init`."""
     return kernel.init(rng_key, num_particles, jitted, model_args, model_kwargs)
 
 
@@ -224,29 +224,30 @@ def sample_SMC(
     Estimate posterior using Sequential Monte Carlo with adaptive tempering.
 
     Args:
-        kernel: SMCKernel instance for particle mutation
+        kernel: `SMCKernel` instance for particle mutation
         num_chains: Number of independent chains to run
         num_particles: Number of particles (per chain)
         num_steps: Maximum number of SMC steps
         num_mcmc_steps: Number of MCMC steps per SMC step
-        beta_schedule: Array of tempering factors used in each SMC step. Length must be num_steps.
+        beta_schedule: Array of tempering factors used in each SMC step. Length must be `num_steps`.
             Tempering factor at initialization is always 0 and must not be passed here.
-            Exactly one of ess_threshold and beta_schedule must be passed.
-        ess_threshold: ESS threshold as fraction of num_particles for adaptive tempering.
-            Exactly one of ess_threshold and beta_schedule must be passed.
-        model_args: Tuple of model arguments (must be JAX-compatible)
-        model_kwargs: Dict of model keyword arguments (must be JAX-compatible)
+            Exactly one of `ess_threshold` and `beta_schedule` must be passed.
+        ess_threshold: ESS threshold as fraction of `num_particles` for adaptive tempering.
+            Exactly one of `ess_threshold` and `beta_schedule` must be passed.
+        model_args: Tuple of model arguments
+        model_kwargs: Dict of model keyword arguments
         rng_key: JAX random key
-        chain_method: Method for running chains ('sequential', 'vectorized', or 'parallel')
+        chain_method: Method for running chains (`sequential`, `vectorized`, or `parallel`)
         progress_bar: Whether to display progress bar
-        extra_fields: Extra fields from the SMCState to collect at each iteration.
-            Similar to MCMC.run, specify field names like "log_likelihoods", "accept_prob", "beta" etc.
-        jit_sample_fn: Whether to JIT compile the sample function.
-            Setting to False leads to very poor performance - use for debugging only.
+        extra_fields: Extra fields from the `SMCState` to collect at each iteration.
+            Similar to `MCMC.run`, specify field names like `log_likelihoods`, `accept_prob`, `beta` etc.
+        jit_sample_fn: Whether to JIT compile the sample function. If this is `True`, `model_args` and `model_kwargs`
+            must be dynamic JAX arguments.
+            Setting to `False` leads to very poor performance - use for debugging only.
 
     Returns:
-        particles_constrained: Final particles in constrained space (shape: [num_chains, num_particles, ...])
-        extra: Dict of collected extra_fields (if extra_fields is non-empty) (shape: [num_steps, num_chains, num_particles, ...])
+        particles_constrained: Final particles in constrained space (shape: `(num_chains, num_particles, ...)`)
+        extra: Dict of collected `extra_fields` (shape: `(num_steps, num_chains, num_particles, ...)`)
     """
     if model_kwargs is None:
         model_kwargs = {}
